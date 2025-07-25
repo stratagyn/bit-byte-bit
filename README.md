@@ -1,4 +1,4 @@
-An `n`-bit string represented as &lceil; `n/8` &rceil; bytes.
+A bit string represented as &lceil; `n/8` &rceil; bytes.
 
 ## Example
 

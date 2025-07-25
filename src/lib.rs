@@ -53,9 +53,9 @@
 //!
 //! assert_eq!(bits, Bits::new([0x0A, 0x0B, 0x0C]));
 //!
-//! let repeated = bits![8; 0x0F; 20];
+//! let repeated_bytes = bits![8; 0x0F; 20];
 //!
-//! assert_eq!(repeated, Bits::new([0x0F; 20]));
+//! assert_eq!(repeated_bytes, Bits::new([0x0F; 20]));
 //!
 //! let aligned_bits = bits![0x0A, 0x0B, 0x0C; => 16];
 //!
@@ -168,10 +168,7 @@ use std::alloc::Layout;
 use std::cmp::Ordering;
 use std::fmt::{Binary, Debug, Display, Formatter};
 use std::iter::FusedIterator;
-use std::ops::{
-    BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign,
-    Div, Not, Shl, ShlAssign, Shr, ShrAssign
-};
+use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Bound, Div, Not, RangeBounds, Shl, ShlAssign, Shr, ShrAssign};
 
 
 macro_rules! bitop {
@@ -270,6 +267,35 @@ macro_rules! pointer {
     }};
 }
 
+
+pub(crate) fn get_bits(src: &[u8], start: usize, length: usize) -> Vec<u8> {
+    let nbytes_src = src.len();
+    let (start_byte, start_idx) = divrem8!(start);
+    let (nbytes, overflow) = divrem8!(ceil; length);
+    let mut bytes = vec![0; nbytes];
+    let take_all = nbytes >= (nbytes_src - start_byte);
+
+    if start_idx > 0 {
+        let shift_mask = (1 << start_idx) - 1;
+        let upper_length = 8 - start_idx;
+        let end_byte = if take_all { nbytes_src - 1 } else { start_byte + nbytes };
+
+        for i in start_byte..end_byte {
+            bytes[i - start_byte] = src[i] >> start_idx;
+            bytes[i - start_byte] |= (src[i + 1] & shift_mask) << upper_length;
+        }
+
+        if take_all { bytes[nbytes_src - start_byte - 1] = src[nbytes_src - 1] >> start_idx; }
+    } else {
+        let end_byte = if take_all { nbytes_src } else { nbytes };
+
+        for i in start_byte..end_byte { bytes[i - start_byte] = src[i] }
+    }
+
+    bytes[nbytes - 1] &= mask!(overflow);
+
+    bytes
+}
 
 fn trim(mut bytes: Vec<u8>) -> Vec<u8> {
     let (mut upper_bound, mut i) = (bytes.len().saturating_sub(1), 0);
@@ -598,21 +624,25 @@ impl Bits {
     ///
     /// assert_eq!(x2, Bits::empty());
     ///
-    /// let x3 = Bits::take(&[0x0A, 0x0B, 0x0C], 25, 17);
+    /// let x3 = Bits::take(&[0x0A, 0x0B, 0x0C], 1, 1);
     ///
-    /// assert_eq!(x3, Bits::zeros(17));
+    /// assert_eq!(x3, Bits::from([0x01]));
     ///
-    /// let x4 = Bits::take(&[0x0A, 0x0B, 0x0C], 1, 17);
+    /// let x4 = Bits::take(&[0x0A, 0x0B, 0x0C], 25, 17);
     ///
-    /// assert_eq!(x4, Bits::slice(&[0x85, 0x05, 0x00], 17));
+    /// assert_eq!(x4, Bits::zeros(17));
     ///
-    /// let x5 = Bits::take(&[0x0A, 0x0B, 0x0C], 1, 16);
+    /// let x5 = Bits::take(&[0x0A, 0x0B, 0x0C], 1, 17);
     ///
-    /// assert_eq!(x5, Bits::new([0x85, 0x05]));
+    /// assert_eq!(x5.bytes().to_vec(), vec![0x85, 0x05, 0x00]);
     ///
-    /// let x6 = Bits::take(&[0x00, 0x00, 0x00], 1, 17);
+    /// let x6 = Bits::take(&[0x0A, 0x0B, 0x0C], 1, 16);
     ///
-    /// assert_eq!(x6, Bits::zeros(17));
+    /// assert_eq!(x6.bytes().to_vec(), vec![0x85, 0x05]);
+    ///
+    /// let x7 = Bits::take(&[0x00, 0x00, 0x00], 1, 17);
+    ///
+    /// assert_eq!(x7, Bits::zeros(17));
     /// ```
     pub fn take(src: &[u8], start: usize, length: usize) -> Self {
         if length == 0 { return Bits::empty(); }
@@ -621,38 +651,15 @@ impl Bits {
 
         if nbytes_src == 0 || start >= (nbytes_src << 3) { return Bits::zeros(length); }
 
-        let (start_byte, start_idx) = divrem8!(start);
         let (nbytes, overflow) = divrem8!(ceil; length);
-        let mask = mask!(overflow);
-        let mut bytes = vec![0; nbytes];
-        let take_all = nbytes >= (nbytes_src - start_byte);
-
-        if start_idx > 0 {
-            let shift_mask = (1 << start_idx) - 1;
-            let upper_length = 8 - start_idx;
-            let end_byte = if take_all { nbytes_src - 1 } else { nbytes };
-
-            for i in start_byte..end_byte {
-                bytes[i - start_byte] = src[i] >> start_idx;
-                bytes[i - start_byte] |= (src[i + 1] & shift_mask) << upper_length;
-            }
-
-            if take_all { bytes[nbytes_src - start_byte - 1] = src[nbytes_src - 1] >> start_idx; }
-        } else {
-            let end_byte = if take_all { nbytes_src } else { nbytes };
-
-            for i in start_byte..end_byte { bytes[i - start_byte] = src[i] }
-        }
-
-        bytes[nbytes - 1] &= mask;
-
+        let mut bytes = get_bits(src, start, length);
         let pointer = bytes.as_mut_ptr();
 
         std::mem::forget(bytes);
 
         let bytes = RawBytes { bytes: NonNull::new(pointer).unwrap(), cap: nbytes, nbytes };
 
-        Bits { words: bytes, mask, nbits: length, padding: (8 - overflow) & 7 }
+        Bits { words: bytes, mask: mask!(overflow), nbits: length, padding: (8 - overflow) & 7 }
     }
 
     /// Creates a bit string of zeros.
@@ -1678,45 +1685,6 @@ impl Bits {
         self.nbits += count << 3;
     }
 
-    /// Creates a bit string by copying a range of bits.
-    ///
-    /// When the length is greater than the available number of bits in the source,
-    /// the result is padded with zeros.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::empty();
-    /// let y1 = x1.range(1, 18);
-    ///
-    /// assert_eq!(y1, Bits::zeros(17));
-    ///
-    /// let x2 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let y2 = x2.range(1, 0);
-    ///
-    /// assert_eq!(y2, Bits::empty());
-    ///
-    /// let x3 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let y3 = x3.range(1, 18);
-    ///
-    /// assert_eq!(y3, Bits::slice(&[0x85, 0x05, 0x00], 17));
-    ///
-    /// let x4 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let y4 = x4.range(1, 17);
-    ///
-    /// assert_eq!(y4, Bits::new([0x85, 0x05]));
-    ///
-    /// let x5 = Bits::zeros(24);
-    /// let y5 = x5.range(8, 24);
-    ///
-    /// assert_eq!(y5, Bits::zeros(16));
-    /// ```
-    pub fn range(&self, start: usize, end: usize) -> Self {
-        if end <= start { Bits::empty() } else {
-            Bits::take(self.bytes(), start, end - start)
-        }
-    }
-
     /// Sets a bit to zero.
     ///
     /// # Examples
@@ -1909,6 +1877,27 @@ impl Bits {
                 }
             }
         }
+    }
+
+    /// Reverses the order of the bits.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// assert_eq!(x1.reversed(), Bits::slice(&[0x03, 0x0D, 0x05], 20));
+    ///
+    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
+    ///
+    /// assert_eq!(x2.reversed(), Bits::new([0x30, 0xD0, 0x50]));
+    /// ```
+    pub fn reversed(&self) -> Self {
+        let mut cloned = self.clone();
+
+        cloned.reverse();
+
+        cloned
     }
 
     /// Rotates bits to the left.
@@ -2930,6 +2919,79 @@ impl Bits {
     /// assert_eq!(x2.len(), 24);
     /// ```
     pub fn xor_mut(&mut self, rhs: &Bits) { bitop!(assign; self, ^=, rhs) }
+
+    /// Creates a bit string by copying a range of bits.
+    ///
+    /// The range is truncated to take no more than the number of available bits from the
+    /// starting bound. For alternative behavior, consider [Bits::take], which pads zeros
+    /// when the length exceeds the number of available bits.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let x1 = Bits::empty();
+    /// let x1_r1 = x1.xrange(1..18);
+    ///
+    /// assert_eq!(x1_r1, Bits::empty());
+    ///
+    /// let x2 = Bits::zeros(24);
+    /// let x2_r1 = x2.xrange(8..24);
+    /// let x2_r2 = x2.xrange(8..=23);
+    ///
+    /// assert_eq!(x2_r1, Bits::zeros(16));
+    /// assert_eq!(x2_r2, x2_r1);
+    ///
+    /// let x3 = Bits::from([0x0A, 0x0B, 0x0C]);
+    /// let x3_r1 = x3.xrange(1..2);
+    ///
+    /// assert_eq!(x3_r1, Bits::from([0x01]));
+    ///
+    /// let x3_r2 = x3.xrange(0..);
+    /// let x3_r3 = x3.xrange(..);
+    ///
+    /// assert_eq!(x3_r2, x3);
+    /// assert_eq!(x3_r3, x3_r2);
+    ///
+    /// let x3_r4 = x3.xrange(..32);
+    ///
+    /// assert_eq!(x3_r4, Bits::from([0x0A, 0x0B, 0x0C]));
+    /// assert_eq!(x3_r4.len(), 20);
+    ///
+    /// let x3_r5 = x3.xrange(18..32);
+    ///
+    /// assert_eq!(x3_r5, Bits::from([0x3]));
+    /// assert_eq!(x3_r5.len(), 2);
+    ///
+    /// let x3_r6 = x3.xrange(8..0);
+    ///
+    /// assert_eq!(x3_r6, Bits::empty());
+    /// ```
+    pub fn xrange<R: RangeBounds<usize>>(&self, bounds: R) -> Self {
+        if let Bound::Excluded(&usize::MAX) = bounds.start_bound() {
+            return Bits::empty();
+        } else if let Bound::Excluded(&0) = bounds.end_bound() {
+            return Bits::empty();
+        }
+
+        let start = match bounds.start_bound() {
+            Bound::Included(n) if *n < self.nbits => *n,
+            Bound::Unbounded => 0,
+            Bound::Excluded(n) if *n < self.nbits => *n + 1,
+            _ => self.nbits,
+        };
+
+        let end = match bounds.end_bound() {
+            Bound::Excluded(n) if *n < self.nbits => *n,
+            Bound::Included(n) if *n < self.nbits => *n + 1,
+            _ => self.nbits,
+        };
+
+        if start >= end {
+            Bits::empty()
+        } else {
+            Bits::take(self.bytes(), start, end - start)
+        }
+    }
 
     fn cons_bit(&mut self, nbits: usize, fill: u8) {
         unsafe {
@@ -4530,4 +4592,170 @@ macro_rules! bits {
     ($($byte:expr),+ $(,)?) => {{ Bits::new(vec![$($byte),+]) }};
     ($($byte:expr),+; => $n:expr) => { Bits::aligned($n, vec![$($byte),+]) };
     ($($byte:expr),+; %) => { Bits::packed(vec![$($byte),+]) };
+}
+
+/// Packs up to 64 bits as a given integral type.
+///
+/// `$bytes` is a byte array large enough to pack `min($length_in_bits, 64)` bits. When
+/// `$bytes` is an array of values that can be cast as `$int`, the result is
+/// input-dependent.`$int` is an integral type large enough to hold a value with
+/// `min($length_in_bits, 64)` bits.
+///
+/// In some cases, it could be more efficient to use one of the unrolled forms,
+/// over the general one. This is because the general case first tries
+/// to figure out which version of the unrolled code to use.
+///
+/// # Example
+/// ```
+/// # use bit_byte_bit::{pack_to_int};
+/// let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+/// let bytes_u64 = [0x01u64, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+/// let pack_usize = pack_to_int!(usize; bytes; 17);
+///
+/// assert_eq!(pack_usize, 0x12301);
+///
+/// let pack_u64_general = pack_to_int!(u64; bytes; 48);
+///
+/// let pack_u64_general_u64 = pack_to_int!(bytes_u64; 48);
+///
+/// let pack_u64_unrolled = pack_to_int!(u64;
+///     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+/// );
+///
+/// let pack_u64_unrolled_u64 = pack_to_int!(
+///     bytes_u64[0], bytes_u64[1], bytes_u64[2], bytes_u64[3], bytes_u64[4], bytes_u64[5]
+/// );
+///
+/// let pack_u64_unrolled_bytes = pack_to_int!(u64;
+///     0x01, 0x23, 0x45, 0x67, 0x89, 0xAB
+/// );
+///
+/// let pack_u64_unrolled_u64_bytes = pack_to_int!(
+///     0x01u64, 0x23, 0x45, 0x67, 0x89, 0xAB
+/// );
+///
+/// assert_eq!(pack_u64_general, 0xAB8967452301);
+/// assert_eq!(pack_u64_general, pack_u64_general_u64);
+/// assert_eq!(pack_u64_general, pack_u64_unrolled);
+/// assert_eq!(pack_u64_general, pack_u64_unrolled_u64);
+/// assert_eq!(pack_u64_general, pack_u64_unrolled_bytes);
+/// assert_eq!(pack_u64_general, pack_u64_unrolled_u64_bytes);
+/// ```
+///
+/// ```should_panic
+/// # use bit_byte_bit::{pack_to_int};
+/// let bytes = vec![0x01, 0x23];
+///
+/// // panics since `bytes.len() == 2` and 8 bytes are expected
+/// let pack_u16 = pack_to_int!(u64; bytes; 64);
+/// ```
+
+/// ```should_panic
+/// # use bit_byte_bit::{pack_to_int};
+/// let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
+///
+/// // panics because of eventual left shift with overflow due to treating a
+/// // u16 value as if it had 64 bits.
+/// let pack_u16 = pack_to_int!(u16; bytes; 64);
+/// ```
+#[macro_export]
+macro_rules! pack_to_int {
+    ($int:ty; $bytes:expr; $length_in_bits:expr) =>{{
+        if $length_in_bits == 0 {
+            0
+        } else {
+            let (sat_length, mask) = if $length_in_bits >= 64 {
+                (64, 0xFFFFFFFFFFFFFFFFu64 as $int)
+            } else {
+                ($length_in_bits, ((1u64 << $length_in_bits) - 1) as $int)
+            };
+
+            let packed = match sat_length {
+                n if n <= 8 => $bytes[0] as $int,
+                n if n <= 16 => pack_to_int!($int; $bytes[0], $bytes[1]),
+                n if n <= 24 => pack_to_int!($int; $bytes[0], $bytes[1], $bytes[2]),
+                n if n <= 32 => pack_to_int!($int; $bytes[0], $bytes[1], $bytes[2], $bytes[3]),
+                n if n <= 40 => pack_to_int!($int;
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4]
+                ),
+                n if n <= 48 => pack_to_int!($int;
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5]
+                ),
+                n if n <= 56 => pack_to_int!($int;
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5], $bytes[6]
+                ),
+                _ => pack_to_int!($int;
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3],
+                    $bytes[4], $bytes[5], $bytes[6], $bytes[7]
+                )
+            };
+
+            packed & mask
+        }
+    }};
+    ($ty:ty; $b0:expr, $b1:expr) =>{ ($b0 as $ty) | (($b1 as $ty) << 8) };
+    ($ty:ty; $b0:expr, $b1:expr, $b2:expr) => {
+        pack_to_int!($ty; $b0, $b1) | (($b2 as $ty) << 16)
+    };
+    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr) => {
+        pack_to_int!($ty; $b0, $b1, $b2) | (($b3 as $ty) << 24)
+    };
+    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr) => {
+        pack_to_int!($ty; $b0, $b1, $b2, $b3) | (($b4 as $ty) << 32)
+    };
+    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr) => {
+        pack_to_int!($ty; $b0, $b1, $b2, $b3, $b4) | (($b5 as $ty) << 40)
+    };
+    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr) => {
+        pack_to_int!($ty; $b0, $b1, $b2, $b3, $b4, $b5) | (($b6 as $ty) << 48)
+    };
+    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr, $b7:expr) => {
+        pack_to_int!($ty; $b0, $b1, $b2, $b3, $b4, $b5, $b6) | (($b7 as $ty) << 56)
+    };
+    ($bytes:expr; $length_in_bits:expr) =>{{
+        if $length_in_bits == 0 {
+            0
+        } else {
+            let (sat_length, mask) = if $length_in_bits >= 64 {
+                (64, 0xFFFFFFFFFFFFFFFFu64)
+            } else {
+                ($length_in_bits, ((1 << $length_in_bits) - 1))
+            };
+
+            let packed = match sat_length {
+                n if n <= 8 => $bytes[0],
+                n if n <= 16 => pack_to_int!($bytes[0], $bytes[1]),
+                n if n <= 24 => pack_to_int!($bytes[0], $bytes[1], $bytes[2]),
+                n if n <= 32 => pack_to_int!($bytes[0], $bytes[1], $bytes[2], $bytes[3]),
+                n if n <= 40 => pack_to_int!($bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4]),
+                n if n <= 48 => pack_to_int!(
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5]
+                ),
+                n if n <= 56 => pack_to_int!(
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5], $bytes[6]
+                ),
+                _ => pack_to_int!(
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3],
+                    $bytes[4], $bytes[5], $bytes[6], $bytes[7]
+                )
+            };
+
+            packed & mask
+        }
+    }};
+    ($b0:expr, $b1:expr) =>{ $b0 | ( $b1 << 8) };
+    ($b0:expr, $b1:expr, $b2:expr) => { pack_to_int!($b0, $b1) | ($b2 << 16) };
+    ($b0:expr, $b1:expr, $b2:expr, $b3:expr) => { pack_to_int!($b0, $b1, $b2) | ($b3 << 24) };
+    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr) => { 
+        pack_to_int!($b0, $b1, $b2, $b3) | ($b4 << 32)
+    };
+    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr) => {
+        pack_to_int!($b0, $b1, $b2, $b3, $b4) | ($b5 << 40)
+    };
+    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr) => {
+        pack_to_int!($b0, $b1, $b2, $b3, $b4, $b5) | ($b6 << 48)
+    };
+    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr, $b7:expr) => {
+        pack_to_int!($b0, $b1, $b2, $b3, $b4, $b5, $b6) | ($b7 << 56)
+    }
 }

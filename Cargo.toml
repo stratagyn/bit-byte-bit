@@ -2,11 +2,11 @@
 name = "bit-byte-bit"
 version = "0.1.0"
 edition = "2024"
-description = "Implements an `n`-bit string using a collection of bytes."
+description = "Implements a bit string using a collection of bytes."
 readme = "README.md"
 repository = "https://github.com/stratagyn/bit-byte-bit"
 license = "MIT OR Apache-2.0"
-keywords = ["bit-array", "bit-string", "bits", "byte-array", "bytes"]
+keywords = ["bitarray", "bitstring", "bits", "bytearray", "bytes"]
 categories = ["data-structures"]
 
-[dependencies]
+[dev-dependencies]
