@@ -1,7 +1,8 @@
 A bit string represented as &lceil; `n/8` &rceil; bytes.
 
-## Example
+* [Documentation](https://stratagyn.github.io/bit-byte-bit)
 
+---
 
 ```rust
 use bit_byte_bit::Bits;

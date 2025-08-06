@@ -115,7 +115,7 @@
 //! assert_eq!(x.and(&y), Bits::new([0x20, 0x30, 0x40]));
 //! assert_eq!(x.complement(), Bits::new([0xDF, 0xCF, 0xBF]));
 //! assert_eq!(x.or(&y), Bits::new([0xA0, 0xB0, 0xC0]));
-//! assert_eq!(x.xor(&y), Bits::new([0x80, 0x80, 0x80]));
+//! assert_eq!(x ^ &y, Bits::new([0x80, 0x80, 0x80]));
 //!
 //! let bits = Bits::from([0x0A, 0x0B, 0x0C]);
 //!
@@ -136,7 +136,7 @@
 //! * [Bits::into_bytes]
 //!
 //!```
-//! # use bit_byte_bit::{Bits};
+//! # use bit_byte_bit::{bits_as, Bits};
 //! let x = Bits::new([0xAB, 0xCD, 0xEF]);
 //!
 //! let mut ones = 0;
@@ -154,22 +154,87 @@
 //! let mut y = x.bytes().iter();
 //!
 //! assert_eq!(y.next(), Some(&0xAB));
+//! 
+//! let bits = Bits::new([0xBA, 0xDC, 0xFE]);
+//! let shorts = bits_as::vec_i16(&bits);
+//! let mut shorts_iter = shorts.into_iter();
+//! 
+//! assert_eq!(shorts_iter.next(), Some(0xDCBAu16 as i16));
+//! assert_eq!(shorts_iter.next(), Some(0xFFFEu16 as i16));
+//! 
+//! let ushorts = Vec::<u16>::from(bits);
+//! let mut ushorts_iter = ushorts.into_iter();
+//! 
+//! assert_eq!(ushorts_iter.next(), Some(0xDCBA));
+//! assert_eq!(ushorts_iter.next(), Some(0x00FE));
 //! ```
-//!
-//! ## Note about endianness
-//!
-//! While the library does not implement any notion of endianness, indexing and methods ending
-//! in either `_left` or `_right` assume bit<sub>0</sub> of an n-bit string is the most right bit,
-//! while bit<sub>n-1</sub> is most left.
+
+mod scheme;
+mod conversion;
+mod operators;
+mod iteration;
+mod bytes;
+
+pub use scheme::*;
+pub use conversion::*;
+pub use iteration::*;
+
 
 use std::ptr::NonNull;
-use std::{alloc, ptr, slice};
+use std::{alloc, ptr};
 use std::alloc::Layout;
 use std::cmp::Ordering;
 use std::fmt::{Binary, Debug, Display, Formatter};
-use std::iter::FusedIterator;
-use std::ops::{BitAnd, BitAndAssign, BitOr, BitOrAssign, BitXor, BitXorAssign, Bound, Div, Not, RangeBounds, Shl, ShlAssign, Shr, ShrAssign};
+use std::ops::{Bound, Deref, Div, RangeBounds};
 
+use bytes::RawBytes;
+
+
+/// Macro implementing a subset of the [Bits] constructors
+///
+/// Example
+/// ```
+/// # use bit_byte_bit::{Bits, bits};
+/// let x1 = bits![];
+///
+/// assert_eq!(x1, Bits::empty());
+///
+/// let x2 = bits![0x0A, 0x0B, 0x0C];
+///
+/// assert_eq!(x2, Bits::new([0x0A, 0x0B, 0x0C]));
+///
+/// let x3 = bits![0x0A, 0x0B, 0x0C; => 16];
+///
+/// assert_eq!(x3, Bits::aligned(16, [0x0A, 0x0B, 0x0C]));
+///
+/// let x4 = bits![0x0A, 0x0B, 0x0C; %];
+///
+/// assert_eq!(x4, Bits::packed([0x0A, 0x0B, 0x0C]));
+///
+/// let x5 = bits![1; 17];
+///
+/// assert_eq!(x5, Bits::ones(17));
+///
+/// let x6 = bits![0; 17];
+///
+/// assert_eq!(x6, Bits::zeros(17));
+/// assert_eq!(x6.len(), 17);
+///
+/// let x7 = bits![8; 0; 17];
+///
+/// assert_eq!(x7, Bits::new(vec![0; 17]));
+/// assert_eq!(x7.len(), 136);
+/// ```
+#[macro_export]
+macro_rules! bits {
+    () => { Bits::empty() };
+    (0; $n:expr) => { Bits::zeros($n) };
+    (1; $n:expr) => { Bits::ones($n) };
+    (8; $byte:expr; $n:expr) => { Bits::new(vec![$byte; $n]) };
+    ($($byte:expr),+ $(,)?) => {{ Bits::new(vec![$($byte),+]) }};
+    ($($byte:expr),+; => $n:expr) => { Bits::aligned($n, vec![$($byte),+]) };
+    ($($byte:expr),+; %) => { Bits::packed(vec![$($byte),+]) };
+}
 
 macro_rules! bitop {
     ($self:expr, $op:tt, $rhs:expr) => {
@@ -331,108 +396,6 @@ fn trim(mut bytes: Vec<u8>) -> Vec<u8> {
 }
 
 
-struct RawBytes {
-    cap: usize,
-    bytes: NonNull<u8>,
-    nbytes: usize
-}
-
-impl RawBytes {
-    fn as_ptr_const(&self) -> *const u8 { self.bytes.as_ptr().cast_const() }
-
-    fn as_ptr_mut(&self) -> *mut u8 { self.bytes.as_ptr() }
-
-    fn expand_to(&mut self, nbytes: usize) {
-        let new_layout = Layout::array::<u8>(nbytes).unwrap();
-
-        assert!(new_layout.size() <= isize::MAX as usize, "Allocation too large");
-
-        let pointer = if self.cap == 0 {
-            unsafe { alloc::alloc(new_layout) }
-        } else {
-            let old_layout = Layout::array::<u8>(self.cap).unwrap();
-            let old_pointer = self.bytes.as_ptr();
-
-            unsafe { alloc::realloc(old_pointer, old_layout, new_layout.size()) }
-        };
-
-        self.bytes = match NonNull::new(pointer) {
-            Some(p) => p,
-            None => alloc::handle_alloc_error(new_layout)
-        };
-
-        self.cap = nbytes;
-    }
-
-    fn shift_right(&mut self, end: usize, mask: u8, up: usize, down: usize) {
-        unsafe {
-            let pointer = self.bytes.as_ptr();
-
-            for i in 0..(end - 1) {
-                *pointer.add(i) >>= down;
-                *pointer.add(i) |= (*pointer.add(i + 1) & mask) << up;
-            }
-
-            *pointer.add(end - 1) >>= down;
-        }
-    }
-
-    fn shift_right_from(&mut self, start: usize, end: usize, mask: u8, up: usize, down: usize) {
-        unsafe {
-            let pointer = self.bytes.as_ptr();
-
-            for i in start..end {
-                *pointer.add(i - 1) |= (*pointer.add(i) & mask) << up;
-                *pointer.add(i) >>= down;
-            }
-        }
-    }
-
-    fn shrink_to(&mut self, nbytes: usize) {
-        if self.cap <= nbytes { return; }
-
-        let old_layout = Layout::array::<u8>(self.cap).unwrap();
-        let old_pointer = self.bytes.as_ptr();
-
-        unsafe {
-            for i in nbytes..self.nbytes { ptr::read(old_pointer.add(i)); }
-
-            if nbytes == 0 {
-                alloc::dealloc(old_pointer, old_layout);
-                self.bytes = NonNull::dangling();
-            } else {
-                let new_layout = Layout::array::<u8>(nbytes).unwrap();
-                let pointer = alloc::realloc(old_pointer, old_layout, new_layout.size());
-
-                self.bytes = match NonNull::new(pointer) {
-                    Some(p) => p,
-                    None => alloc::handle_alloc_error(new_layout)
-                };
-            }
-        }
-
-        self.cap = nbytes;
-        self.nbytes = nbytes;
-    }
-}
-
-impl Drop for RawBytes {
-    fn drop(&mut self) {
-
-        if self.cap != 0 {
-            unsafe {
-                alloc::dealloc(self.bytes.as_ptr(), Layout::array::<u8>(self.cap).unwrap());
-            }
-        }
-    }
-}
-
-unsafe impl Send for RawBytes {}
-
-unsafe impl Sync for RawBytes {}
-
-
-
 pub struct Bits {
     words: RawBytes,
     mask: u8,
@@ -442,8 +405,6 @@ pub struct Bits {
 
 impl Bits {
     /// Creates a bit string from a sequence of bytes.
-    ///
-    /// To ignore leading zeros use [Bits::from] or [Bits::from_iter].
     ///
     /// # Examples
     /// ```
@@ -897,7 +858,7 @@ impl Bits {
     pub fn byte(&self, i: usize) -> u8 {
         assert!(i < self.size(), "Index out of bounds");
 
-        unsafe { *self.words.as_ptr_mut().add(i) }
+        unsafe { *self.words.as_ptr_const().add(i) }
     }
 
     /// Underlying bytes
@@ -910,9 +871,7 @@ impl Bits {
     ///
     /// assert_eq!(y, vec![0xAB, 0xCD, 0xEF]);
     /// ```
-    pub fn bytes(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.words.as_ptr_const(), self.size()) }
-    }
+    pub fn bytes(&self) -> &[u8] { self.words.deref() }
 
     /// Flips every bit.
     ///
@@ -1263,7 +1222,7 @@ impl Bits {
 
         std::mem::forget(self);
 
-        IntoBytes { iter, _bytes: bytes}
+        IntoBytes::new(iter, bytes)
     }
 
     /// An iterator over the individual bits
@@ -3084,46 +3043,6 @@ impl Bits {
     fn shrink_to_fit(&mut self) { self.words.shrink_to(1 + ((self.nbits - 1) >> 3)); }
 }
 
-impl Clone for Bits {
-    fn clone(&self) -> Self {
-        match self.size() {
-            0 => Bits::empty(),
-            nbytes => unsafe {
-                let pointer = self.words.as_ptr_mut();
-                let layout = Layout::array::<u8>(nbytes).unwrap();
-                let clone = alloc::alloc(layout);
-
-                for i in 0..nbytes { ptr::write(clone.add(i), *pointer.add(i)); }
-
-                *clone.add(nbytes - 1) &= self.mask;
-
-                let bytes = RawBytes { bytes: NonNull::new(clone).unwrap(), cap: nbytes, nbytes };
-
-                Bits { words: bytes, mask: self.mask, nbits: self.nbits, padding: self.padding }
-            }
-        }
-    }
-}
-
-impl Drop for Bits {
-    fn drop(&mut self) {
-
-        if self.words.nbytes > 0 {
-            unsafe {
-                let pointer = self.words.as_ptr_mut();
-
-                for i in 0..self.words.nbytes { ptr::read(pointer.add(i)); }
-            }
-        }
-    }
-}
-
-unsafe impl Send for Bits {}
-
-unsafe impl Sync for Bits {}
-
-/* Section::Display */
-
 impl Binary for Bits {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         unsafe {
@@ -3149,6 +3068,27 @@ impl Binary for Bits {
     }
 }
 
+impl Clone for Bits {
+    fn clone(&self) -> Self {
+        match self.size() {
+            0 => Bits::empty(),
+            nbytes => unsafe {
+                let pointer = self.words.as_ptr_mut();
+                let layout = Layout::array::<u8>(nbytes).unwrap();
+                let clone = alloc::alloc(layout);
+
+                for i in 0..nbytes { ptr::write(clone.add(i), *pointer.add(i)); }
+
+                *clone.add(nbytes - 1) &= self.mask;
+
+                let bytes = RawBytes { bytes: NonNull::new(clone).unwrap(), cap: nbytes, nbytes };
+
+                Bits { words: bytes, mask: self.mask, nbits: self.nbits, padding: self.padding }
+            }
+        }
+    }
+}
+
 impl Debug for Bits {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "Bits<")?;
@@ -3161,13 +3101,111 @@ impl Display for Bits {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result { Binary::fmt(&self, f) }
 }
 
-/* Section::Constructors */
+impl Div<usize> for &Bits {
+    type Output = (Bits, Bits);
+
+    /// Splits the bit string.
+    ///
+    /// When the index is greater than or equal to the length
+    /// of the bit string, the second element of the returned
+    /// pair will be empty. When the index is `0`, the first
+    /// element will be empty.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let x1 = Bits::empty();
+    /// let (l1, r1) = &x1 / 11;
+    ///
+    /// assert_eq!(l1.len(), 0);
+    /// assert_eq!(r1.len(), 0);
+    ///
+    /// let x2 = Bits::from([0x0A, 0x0B, 0x0C]);
+    /// let (l2, r2) = &x2 / 20;
+    ///
+    /// assert_eq!(l2, x2);
+    /// assert_eq!(r2.len(), 0);
+    ///
+    /// let (l3, r3) = &x2 / 0;
+    ///
+    /// assert_eq!(l3.len(), 0);
+    /// assert_eq!(r3, x2);
+    ///
+    /// let (l4, r4) = &x2 / 11;
+    ///
+    /// assert_eq!(l4, Bits::slice(&[0x0A, 0x03], 11));
+    /// assert_eq!(r4, Bits::slice(&[0x81, 0x01], 9));
+    /// ```
+    fn div(self, index: usize) -> Self::Output { self.split(index) }
+}
+
+impl Div<usize> for Bits {
+    type Output = (Bits, Bits);
+
+    /// Splits the bit string.
+    ///
+    /// When the index is greater than or equal to the length
+    /// of the bit string, the second element of the returned
+    /// pair will be empty. When the index is `0`, the first
+    /// element will be empty.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let x1 = Bits::empty();
+    /// let (l1, r1) = x1 / 11;
+    ///
+    /// assert_eq!(l1.len(), 0);
+    /// assert_eq!(r1.len(), 0);
+    ///
+    /// let x2 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// let (l2, r2) = x2 / 11;
+    ///
+    /// assert_eq!(l2, Bits::slice(&[0x0A, 0x03], 11));
+    /// assert_eq!(r2, Bits::slice(&[0x81, 0x01], 9));
+    /// ```
+    fn div(self, index: usize) -> Self::Output { self.split(index) }
+}
+
+impl Drop for Bits {
+    fn drop(&mut self) {
+
+        if self.words.nbytes > 0 {
+            unsafe {
+                let pointer = self.words.as_ptr_mut();
+
+                for i in 0..self.words.nbytes { ptr::read(pointer.add(i)); }
+            }
+        }
+    }
+}
+
+impl Eq for Bits {}
 
 impl From<&[u8]> for Bits {
+    /// Creates a bit string from a sequence of bytes, ignoring leading zeros.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x = Bits::from([0x0A, 0x0B, 0x0C, 0x00].as_slice());
+    ///
+    /// assert_eq!(x.len(), 20);
+    /// ```
     fn from(data: &[u8]) -> Self { Self::from(data.to_vec()) }
 }
 
 impl<const N: usize> From<[u8; N]> for Bits {
+    /// Creates a bit string from a sequence of bytes, ignoring leading zeros.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x = Bits::from([0x0A, 0x0B, 0x0C, 0x00]);
+    ///
+    /// assert_eq!(x.len(), 20);
+    /// ```
     fn from(bytes: [u8; N]) -> Self {
         let mut nbytes = N;
 
@@ -3191,6 +3229,15 @@ impl<const N: usize> From<[u8; N]> for Bits {
 }
 
 impl From<Vec<u8>> for Bits  {
+    /// Creates a bit string from a sequence of bytes, ignoring leading zeros.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x = Bits::from(vec![0x0A, 0x0B, 0x0C, 0x00]);
+    ///
+    /// assert_eq!(x.len(), 20);
+    /// ```
     fn from(mut bytes: Vec<u8>) -> Self {
         let mut nbytes = bytes.len();
 
@@ -3318,6 +3365,15 @@ impl From<Vec<bool>> for Bits {
 }
 
 impl FromIterator<u8> for Bits {
+    /// Creates a bit string from a sequence of bytes, ignoring leading zeros.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x = Bits::from_iter([0x0A, 0x0B, 0x0C, 0x00]);
+    ///
+    /// assert_eq!(x.len(), 20);
+    /// ```
     fn from_iter<I: IntoIterator<Item=u8>>(iter: I) -> Self {
         Bits::from(iter.into_iter().collect::<Vec<u8>>())
     }
@@ -3328,10 +3384,6 @@ impl FromIterator<bool> for Bits {
         Bits::from(iter.into_iter().collect::<Vec<bool>>())
     }
 }
-
-/* Section::Order */
-
-impl Eq for Bits {}
 
 impl Ord for Bits {
     /// Compares a bit string with another
@@ -3429,1333 +3481,6 @@ impl PartialOrd for Bits {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
 }
 
-/* Section::Iteration */
+unsafe impl Send for Bits {}
 
-impl IntoIterator for Bits {
-    type Item = u8;
-    type IntoIter = IntoBits;
-
-    fn into_iter(self) -> Self::IntoIter { IntoBits::new(self, 0) }
-}
-
-
-struct Bytes {
-    start: *const u8,
-    end: *const u8
-}
-
-impl Bytes {
-    unsafe fn new(slice: &[u8]) -> Self {
-        Bytes {
-            start: slice.as_ptr(),
-            end: if slice.len() == 0 {
-                slice.as_ptr()
-            } else {
-                unsafe{ slice.as_ptr().add(slice.len()) }
-            }
-        }
-    }
-}
-
-impl DoubleEndedIterator for Bytes {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.start == self.end {
-            None
-        } else {
-            unsafe {
-                self.end = self.end.offset(-1);
-                Some(ptr::read(self.end))
-            }
-        }
-    }
-}
-
-impl ExactSizeIterator for Bytes {
-    fn len(&self) -> usize { self.end as usize - self.start as usize }
-}
-
-impl FusedIterator for Bytes { }
-
-impl Iterator for Bytes {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<u8> {
-        match self.start == self.end {
-            true => None,
-            false => unsafe {
-                let old_ptr = self.start;
-                self.start = self.start.add(1);
-
-                Some(ptr::read(old_ptr))
-            }
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let len = self.end as usize - self.start as usize;
-
-        (len, Some(len))
-    }
-}
-
-
-pub struct Iter<'a> {
-    bits: &'a Bits,
-    index: usize,
-    exhausted: bool
-}
-
-impl<'a> Iter<'a> {
-    fn new(bits: &'a Bits, index: usize) -> Self {
-        Iter { bits, index, exhausted: bits.nbits == index }
-    }
-
-    /// Moves the iterator ahead until the predicate returns true.
-    ///
-    /// This method behaves like [Iterator::skip_while], but doesn't
-    /// rely on repeated calls to [Iterator::next].
-    pub fn skip_bits_while<P: FnMut(u8) -> bool>(&mut self, mut f: P) -> usize {
-        if self.exhausted { return 0; }
-
-        match (f(0), f(1)) {
-            (true, true) => {
-                let rem = self.bits.len() - self.index;
-
-                self.index = self.bits.len();
-                self.exhausted = true;
-
-                rem
-            },
-            (false, false) => 0,
-            (z, _) => {
-                let ct =
-                    if z { self.bits.trailing_zeros() } else { self.bits.trailing_ones() };
-
-                if ct > self.index {
-                    let skipped = ct - self.index;
-
-                    self.index = ct;
-                    self.exhausted = self.index == self.bits.len();
-
-                    skipped
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// Moves the iterator ahead.
-    ///
-    /// This method behaves like [Iterator::skip], but doesn't rely on
-    /// repeated calls to [Iterator::next].
-    pub fn skip_bits(&mut self, n: usize) {
-        if self.exhausted {
-            return;
-        } else if (self.index + n) >= self.bits.len() {
-            self.index = self.bits.len();
-            self.exhausted = true;
-        } else {
-            self.index += n;
-        }
-    }
-}
-
-impl<'a> DoubleEndedIterator for Iter<'a> {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.index == 0 {
-            None
-        } else {
-            self.index -= 1;
-            self.exhausted = false;
-
-            Some(self.bits.i(self.index))
-        }
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        if self.index < n {
-            None
-        } else {
-            self.index -= n;
-            self.exhausted = false;
-
-            Some(self.bits.i(self.index))
-        }
-    }
-}
-
-impl<'a> ExactSizeIterator for Iter<'a> {
-    fn len(&self) -> usize { self.bits.len() - self.index }
-}
-
-impl<'a> FusedIterator for Iter<'a> { }
-
-impl<'a> Iterator for Iter<'a> {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.exhausted {
-            true => None,
-            false => {
-                let bit = self.bits.i(self.index);
-                self.index += 1;
-                self.exhausted = self.bits.len() == self.index;
-
-                Some(bit)
-            }
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.bits.len() - self.index;
-
-        (rem, Some(rem))
-    }
-
-    fn count(mut self) -> usize {
-        let rem = self.bits.len() - self.index;
-
-        self.index = self.bits.len();
-        self.exhausted = true;
-
-        rem
-    }
-
-    fn last(mut self) -> Option<u8> {
-        if self.exhausted {
-            None
-        } else {
-            let bit = self.bits.i(self.bits.len() - 1);
-
-            self.index = self.bits.len();
-            self.exhausted = true;
-
-            Some(bit)
-        }
-    }
-
-    fn nth(&mut self, n: usize) -> Option<u8> {
-        if self.exhausted {
-            None
-        } else if self.index + n >= self.bits.len() {
-            self.index = self.bits.len();
-            self.exhausted = true;
-
-            None
-        } else {
-            let bit = self.bits.i(self.index + n);
-            self.index += n + 1;
-            self.exhausted = self.index == self.bits.len();
-
-            Some(bit)
-        }
-    }
-}
-
-
-pub struct IntoBits {
-    bits: Bits,
-    index: usize,
-    exhausted: bool
-}
-
-impl IntoBits {
-    fn new(bits: Bits, index: usize) -> Self {
-        let exhausted = bits.nbits == index;
-
-        IntoBits { bits, index, exhausted }
-    }
-
-    /// Moves the iterator ahead until the predicate returns true.
-    ///
-    /// This method behaves like [Iterator::skip_while], but doesn't
-    /// rely on repeated calls to [Iterator::next], instead on the
-    /// return values to `f(0)` and `f(1)`.
-    pub fn skip_bits_while<P: FnMut(u8) -> bool>(&mut self, mut f: P) -> usize {
-        if self.exhausted { return 0; }
-
-        match (f(0), f(1)) {
-            (true, true) => {
-                let rem = self.bits.len() - self.index;
-
-                self.index = self.bits.len();
-                self.exhausted = true;
-
-                rem
-            },
-            (false, false) => 0,
-            (z, _) => {
-                let ct =
-                    if z { self.bits.trailing_zeros() } else { self.bits.trailing_ones() };
-
-                if ct > self.index {
-                    let skipped = ct - self.index;
-
-                    self.index = ct;
-                    self.exhausted = self.index == self.bits.len();
-
-                    skipped
-                } else {
-                    0
-                }
-            }
-        }
-    }
-
-    /// Moves the iterator ahead.
-    ///
-    /// This method behaves like [Iterator::skip], but doesn't rely on
-    /// repeated calls to [Iterator::next].
-    pub fn skip_bits(&mut self, n: usize) {
-        if self.exhausted {
-            return;
-        } else if (self.index + n) >= self.bits.len() {
-            self.index = self.bits.len();
-            self.exhausted = true;
-        } else {
-            self.index += n;
-        }
-    }
-}
-
-impl DoubleEndedIterator for IntoBits {
-    fn next_back(&mut self) -> Option<Self::Item> {
-        if self.index == 0 {
-            None
-        } else {
-            self.index -= 1;
-            self.exhausted = false;
-
-            Some(self.bits.i(self.index))
-        }
-    }
-
-    fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-        if self.index < n {
-            None
-        } else {
-            self.index -= n;
-            self.exhausted = false;
-
-            Some(self.bits.i(self.index))
-        }
-    }
-}
-
-impl ExactSizeIterator for IntoBits {
-    fn len(&self) -> usize { self.bits.len() - self.index }
-}
-
-impl FusedIterator for IntoBits { }
-
-impl Iterator for IntoBits {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.exhausted {
-            true => None,
-            false => {
-                let bit = self.bits.i(self.index);
-                self.index += 1;
-                self.exhausted = self.bits.len() == self.index;
-
-                Some(bit)
-            }
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let rem = self.bits.len() - self.index;
-
-        (rem, Some(rem))
-    }
-
-    fn count(mut self) -> usize {
-        let rem = self.bits.len() - self.index;
-
-        self.index = self.bits.len();
-        self.exhausted = true;
-
-        rem
-    }
-
-    fn last(mut self) -> Option<u8> {
-        if self.exhausted {
-            None
-        } else {
-            let bit = self.bits.i(self.bits.len() - 1);
-
-            self.index = self.bits.len();
-            self.exhausted = true;
-
-            Some(bit)
-        }
-    }
-
-    fn nth(&mut self, n: usize) -> Option<u8> {
-        if self.exhausted {
-            None
-        } else if self.index + n >= self.bits.len() {
-            self.index = self.bits.len();
-            self.exhausted = true;
-
-            None
-        } else {
-            let bit = self.bits.i(self.index + n);
-            self.index += n + 1;
-            self.exhausted = self.index == self.bits.len();
-
-            Some(bit)
-        }
-    }
-}
-
-
-pub struct IntoBytes {
-    _bytes: RawBytes,
-    iter: Bytes
-}
-
-impl DoubleEndedIterator for IntoBytes {
-    fn next_back(&mut self) -> Option<Self::Item> { self.iter.next_back() }
-}
-
-impl Drop for IntoBytes {
-    fn drop(&mut self) { for _ in &mut *self { } }
-}
-
-impl ExactSizeIterator for IntoBytes {
-    fn len(&self) -> usize { self.iter.len() }
-}
-
-impl FusedIterator for IntoBytes { }
-
-impl Iterator for IntoBytes {
-    type Item = u8;
-
-    fn next(&mut self) -> Option<u8> { self.iter.next() }
-
-    fn size_hint(&self) -> (usize, Option<usize>) { self.iter.size_hint() }
-}
-
-
-/* Section::Operators */
-
-impl BitAnd for Bits {
-    type Output = Self;
-
-    /// Bitwise and of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 & y1, Bits::new([0x20, 0x30, 0x40]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 & y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitand(self, rhs: Self) -> Self::Output { self.and(&rhs) }
-}
-
-impl BitAnd<&Bits> for Bits {
-    type Output = Bits;
-
-    /// Bitwise and of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 & &y1, Bits::new([0x20, 0x30, 0x40]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 & &y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitand(self, rhs: &Bits) -> Self::Output { self.and(rhs) }
-}
-
-impl BitAnd<&Bits> for &Bits {
-    type Output = Bits;
-
-    /// Bitwise and of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 & &y1, Bits::new([0x20, 0x30, 0x40]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 & &y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitand(self, rhs: &Bits) -> Self::Output { self.and(rhs) }
-}
-
-impl BitAndAssign for Bits {
-    /// Bitwise and of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// x1 &= y1;
-    ///
-    /// assert_eq!(x1, Bits::new([0x20, 0x30, 0x40]));
-    ///
-    /// let mut x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// x2 &= y2;
-    ///
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn bitand_assign(&mut self, rhs: Self) { self.and_mut(&rhs); }
-}
-
-impl BitAndAssign<&Bits> for Bits {
-    /// Bitwise and of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// x1 &= &y1;
-    ///
-    /// assert_eq!(x1, Bits::new([0x20, 0x30, 0x40]));
-    ///
-    /// let mut x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// x2 &= &y2;
-    ///
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn bitand_assign(&mut self, rhs: &Bits) { self.and_mut(rhs); }
-}
-
-impl BitOr for Bits {
-    type Output = Self;
-
-    /// Bitwise or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 | y1, Bits::from([0xA0, 0xB0, 0xC0]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 | y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitor(self, rhs: Self) -> Self::Output { self.or(&rhs) }
-}
-
-impl BitOr<&Bits> for Bits {
-    type Output = Bits;
-
-    /// Bitwise or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 | &y1, Bits::from([0xA0, 0xB0, 0xC0]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 | &y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitor(self, rhs: &Bits) -> Self::Output { self.or(rhs) }
-}
-
-impl BitOr<&Bits> for &Bits {
-    type Output = Bits;
-
-    /// Bitwise or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 | &y1, Bits::from([0xA0, 0xB0, 0xC0]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 | &y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitor(self, rhs: &Bits) -> Self::Output { self.or(rhs) }
-}
-
-impl BitOrAssign for Bits {
-    /// Bitwise or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// x1 |= y1;
-    ///
-    /// assert_eq!(x1, Bits::from([0xA0, 0xB0, 0xC0]));
-    ///
-    /// let mut x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// x2 |= y2;
-    ///
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn bitor_assign(&mut self, rhs: Self) { self.or_mut(&rhs); }
-}
-
-impl BitOrAssign<&Bits> for Bits {
-    /// Bitwise or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// x1 |= &y1;
-    ///
-    /// assert_eq!(x1, Bits::from([0xA0, 0xB0, 0xC0]));
-    ///
-    /// let mut x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// x2 |= &y2;
-    ///
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn bitor_assign(&mut self, rhs: &Bits) { self.or_mut(rhs); }
-}
-
-impl BitXor for Bits {
-    type Output = Self;
-
-    /// Bitwise exclusive or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 ^ y1, Bits::from([0x80, 0x80, 0x80]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 ^ y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitxor(self, rhs: Self) -> Self::Output { self.xor(&rhs) }
-}
-
-impl BitXor<&Bits> for Bits {
-    type Output = Bits;
-
-    /// Bitwise exclusive or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 ^ &y1, Bits::from([0x80, 0x80, 0x80]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 ^ &y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitxor(self, rhs: &Bits) -> Self::Output { self.xor(&rhs) }
-}
-
-impl BitXor<&Bits> for &Bits {
-    type Output = Bits;
-
-    /// Bitwise exclusive or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x1 ^ &y1, Bits::from([0x80, 0x80, 0x80]));
-    ///
-    /// let x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// let z = x2 ^ &y2;
-    ///
-    /// assert_eq!(z.len(), 24);
-    /// ```
-    fn bitxor(self, rhs: &Bits) -> Self::Output { self.xor(&rhs) }
-}
-
-impl BitXorAssign for Bits {
-    /// Bitwise exclusive or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// x1 ^= y1;
-    ///
-    /// assert_eq!(x1, Bits::from([0x80, 0x80, 0x80]));
-    ///
-    /// let mut x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// x2 ^= y2;
-    ///
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn bitxor_assign(&mut self, rhs: Self) { self.xor_mut(&rhs); }
-}
-
-impl BitXorAssign<&Bits> for Bits {
-    /// Bitwise exclusive or of two bit strings.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y1 = Bits::from([0xA0, 0xB0, 0xC0]);
-    ///
-    /// x1 ^= &y1;
-    ///
-    /// assert_eq!(x1, Bits::from([0x80, 0x80, 0x80]));
-    ///
-    /// let mut x2 = Bits::from([0x20, 0x30, 0x40]);
-    /// let y2 = Bits::from([0x0A, 0xB0, 0xC0]);
-    ///
-    /// assert_eq!(x2.len(), 23);
-    /// assert_eq!(y2.len(), 24);
-    ///
-    /// x2 ^= &y2;
-    ///
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn bitxor_assign(&mut self, rhs: &Bits) { self.xor_mut(&rhs); }
-}
-
-impl Div<usize> for Bits {
-    type Output = (Bits, Bits);
-
-    fn div(self, index: usize) -> Self::Output { self.split(index) }
-}
-
-impl Not for Bits {
-    type Output = Self;
-
-    /// Flips every bit.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x = Bits::from([0x0A, 0x0B, 0x0C]);
-    ///
-    /// assert_eq!(!x, Bits::slice(&[0xF5, 0xF4, 0x03], 20));
-    /// ```
-    fn not(self) -> Self::Output { self.complement() }
-}
-
-impl Not for &Bits {
-    type Output = Bits;
-
-    /// Flips every bit.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x = Bits::from([0x0A, 0x0B, 0x0C]);
-    ///
-    /// assert_eq!(!&x, Bits::slice(&[0xF5, 0xF4, 0x03], 20));
-    /// ```
-    fn not(self) -> Self::Output { self.complement() }
-}
-
-impl Shl<usize> for Bits {
-    type Output = Self;
-
-    /// Shifts out upper bits, shifting in zeros on the lower end.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = x1 << 17;
-    ///
-    /// assert_eq!(s1, Bits::slice(&[0x00, 0x00, 0x04], 20));
-    /// assert_eq!(s1.len(), 20);
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = x2 << 4;
-    ///
-    /// assert_eq!(s2, Bits::new([0xA0, 0xB0, 0xC0]));
-    /// assert_eq!(s2.len(), 24);
-    /// ```
-    fn shl(self, count: usize) -> Self::Output { self.shifted_left(count) }
-}
-
-impl Shl<usize> for &Bits {
-    type Output = Bits;
-
-    /// Shifts out upper bits, shifting in zeros on the lower end.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = &x1 << 17;
-    ///
-    /// assert_eq!(s1, Bits::slice(&[0x00, 0x00, 0x04], 20));
-    /// assert_eq!(s1.len(), x1.len());
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = &x2 << 4;
-    ///
-    /// assert_eq!(s2, Bits::new([0xA0, 0xB0, 0xC0]));
-    /// assert_eq!(s2.len(), x2.len());
-    /// ```
-    fn shl(self, count: usize) -> Self::Output { self.shifted_left(count) }
-}
-
-impl Shl<&usize> for Bits {
-    type Output = Self;
-
-    /// Shifts out upper bits, shifting in zeros on the lower end.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = x1 << &17;
-    ///
-    /// assert_eq!(s1, Bits::slice(&[0x00, 0x00, 0x04], 20));
-    /// assert_eq!(s1.len(), 20);
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = x2 << &4;
-    ///
-    /// assert_eq!(s2, Bits::new([0xA0, 0xB0, 0xC0]));
-    /// assert_eq!(s2.len(), 24);
-    /// ```
-    fn shl(self, count: &usize) -> Self::Output { self.shifted_left(*count) }
-}
-
-impl Shl<&usize> for &Bits {
-    type Output = Bits;
-
-    /// Shifts out upper bits, shifting in zeros on the lower end.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = &x1 << &17;
-    ///
-    /// assert_eq!(s1, Bits::slice(&[0x00, 0x00, 0x04], 20));
-    /// assert_eq!(s1.len(), x1.len());
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = &x2 << &4;
-    ///
-    /// assert_eq!(s2, Bits::new([0xA0, 0xB0, 0xC0]));
-    /// assert_eq!(s2.len(), x2.len());
-    /// ```
-    fn shl(self, count: &usize) -> Self::Output { self.shifted_left(*count) }
-}
-
-impl ShlAssign<usize> for Bits {
-    /// Shifts out upper bits, shifting in zeros on the lower end.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x1 <<= 17;
-    ///
-    /// assert_eq!(x1, Bits::slice(&[0x00, 0x00, 0x04], 20));
-    /// assert_eq!(x1.len(), 20);
-    ///
-    /// let mut x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x2 <<= 4;
-    ///
-    /// assert_eq!(x2, Bits::new([0xA0, 0xB0, 0xC0]));
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn shl_assign(&mut self, count: usize) { self.shift_left(count); }
-}
-
-impl ShlAssign<&usize> for Bits {
-    /// Shifts out upper bits, shifting in zeros on the lower end.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x1 <<= &17;
-    ///
-    /// assert_eq!(x1, Bits::slice(&[0x00, 0x00, 0x04], 20));
-    /// assert_eq!(x1.len(), 20);
-    ///
-    /// let mut x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x2 <<= &4;
-    ///
-    /// assert_eq!(x2, Bits::new([0xA0, 0xB0, 0xC0]));
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn shl_assign(&mut self, count: &usize) { self.shift_left(*count); }
-}
-
-impl Shr<usize> for Bits {
-    type Output = Self;
-
-    /// Shifts out lower bits, shifting zeros into the upper bits.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = x1 >> 17;
-    ///
-    /// assert_eq!(s1.len(), 20);
-    /// assert_eq!(s1, Bits::slice(&[0x06, 0x00, 0x00], 20));
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = x2 >> 4;
-    ///
-    /// assert_eq!(s2.len(), 24);
-    /// assert_eq!(s2, Bits::new([0xB0, 0xC0, 0x00]));
-    /// ```
-    fn shr(self, count: usize) -> Self::Output { self.shifted_right(count) }
-}
-
-impl Shr<usize> for &Bits {
-    type Output = Bits;
-
-    /// Shifts out lower bits, shifting zeros into the upper bits.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = &x1 >> 17;
-    ///
-    /// assert_eq!(s1.len(), x1.len());
-    /// assert_eq!(s1, Bits::slice(&[0x06, 0x00, 0x00], 20));
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = &x2 >> 4;
-    ///
-    /// assert_eq!(s2.len(), x2.len());
-    /// assert_eq!(s2, Bits::new([0xB0, 0xC0, 0x00]));
-    /// ```
-    fn shr(self, count: usize) -> Self::Output { self.shifted_right(count) }
-}
-
-impl Shr<&usize> for Bits {
-    type Output = Self;
-
-    /// Shifts out lower bits, shifting zeros into the upper bits.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = x1 >> &17;
-    ///
-    /// assert_eq!(s1.len(), 20);
-    /// assert_eq!(s1, Bits::slice(&[0x06, 0x00, 0x00], 20));
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = x2 >> &4;
-    ///
-    /// assert_eq!(s2.len(), 24);
-    /// assert_eq!(s2, Bits::new([0xB0, 0xC0, 0x00]));
-    /// ```
-    fn shr(self, count: &usize) -> Self::Output { self.shifted_right(*count) }
-}
-
-impl Shr<&usize> for &Bits {
-    type Output = Bits;
-
-    /// Shifts out lower bits, shifting zeros into the upper bits.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let s1 = &x1 >> &17;
-    ///
-    /// assert_eq!(s1.len(), x1.len());
-    /// assert_eq!(s1, Bits::slice(&[0x06, 0x00, 0x00], 20));
-    ///
-    /// let x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    /// let s2 = &x2 >> &4;
-    ///
-    /// assert_eq!(s2.len(), 24);
-    /// assert_eq!(s2, Bits::new([0xB0, 0xC0, 0x00]));
-    /// ```
-    fn shr(self, count: &usize) -> Self::Output { self.shifted_right(*count) }
-}
-
-impl ShrAssign<usize> for Bits {
-    /// Shifts out lower bits, shifting zeros into the upper bits.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x1 >>= 17;
-    ///
-    /// assert_eq!(x1, Bits::slice(&[0x06, 0x00, 0x00], 20));
-    /// assert_eq!(x1.len(), 20);
-    ///
-    /// let mut x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x2 >>= 4;
-    ///
-    /// assert_eq!(x2, Bits::new([0xB0, 0xC0, 0x00]));
-    /// assert_eq!(x2.len(), 24);
-    /// ```
-    fn shr_assign(&mut self, count: usize) { self.shift_right(count); }
-}
-
-impl ShrAssign<&usize> for Bits {
-    /// Shifts out lower bits, shifting zeros into the upper bits.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let mut x1 = Bits::from([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x1 >>= &17;
-    ///
-    /// assert_eq!(x1.len(), 20);
-    /// assert_eq!(x1, Bits::slice(&[0x06, 0x00, 0x00], 20));
-    ///
-    /// let mut x2 = Bits::new([0x0A, 0x0B, 0x0C]);
-    ///
-    /// x2 >>= &4;
-    ///
-    /// assert_eq!(x2.len(), 24);
-    /// assert_eq!(x2, Bits::new([0xB0, 0xC0, 0x00]));
-    /// ```
-    fn shr_assign(&mut self, count: &usize) { self.shift_right(*count); }
-}
-
-
-/* Section::Macro */
-
-
-/// Macro implementing a subset of the [Bits] constructors
-///
-/// Example
-/// ```
-/// # use bit_byte_bit::{Bits, bits};
-/// let x1 = bits![];
-///
-/// assert_eq!(x1, Bits::empty());
-///
-/// let x2 = bits![0x0A, 0x0B, 0x0C];
-///
-/// assert_eq!(x2, Bits::new([0x0A, 0x0B, 0x0C]));
-///
-/// let x3 = bits![0x0A, 0x0B, 0x0C; => 16];
-///
-/// assert_eq!(x3, Bits::aligned(16, [0x0A, 0x0B, 0x0C]));
-///
-/// let x4 = bits![0x0A, 0x0B, 0x0C; %];
-///
-/// assert_eq!(x4, Bits::packed([0x0A, 0x0B, 0x0C]));
-///
-/// let x5 = bits![1; 17];
-///
-/// assert_eq!(x5, Bits::ones(17));
-///
-/// let x6 = bits![0; 17];
-///
-/// assert_eq!(x6, Bits::zeros(17));
-/// assert_eq!(x6.len(), 17);
-///
-/// let x7 = bits![8; 0; 17];
-///
-/// assert_eq!(x7, Bits::new(vec![0; 17]));
-/// assert_eq!(x7.len(), 136);
-/// ```
-#[macro_export]
-macro_rules! bits {
-    () => { Bits::empty() };
-    (0; $n:expr) => { Bits::zeros($n) };
-    (1; $n:expr) => { Bits::ones($n) };
-    (8; $byte:expr; $n:expr) => { Bits::new(vec![$byte; $n]) };
-    ($($byte:expr),+ $(,)?) => {{ Bits::new(vec![$($byte),+]) }};
-    ($($byte:expr),+; => $n:expr) => { Bits::aligned($n, vec![$($byte),+]) };
-    ($($byte:expr),+; %) => { Bits::packed(vec![$($byte),+]) };
-}
-
-/// Packs up to 64 bits as a given integral type.
-///
-/// `$bytes` is a byte array large enough to pack `min($length_in_bits, 64)` bits. When
-/// `$bytes` is an array of values that can be cast as `$int`, the result is
-/// input-dependent.`$int` is an integral type large enough to hold a value with
-/// `min($length_in_bits, 64)` bits.
-///
-/// In some cases, it could be more efficient to use one of the unrolled forms,
-/// over the general one. This is because the general case first tries
-/// to figure out which version of the unrolled code to use.
-///
-/// # Example
-/// ```
-/// # use bit_byte_bit::{pack_to_int};
-/// let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-/// let bytes_u64 = [0x01u64, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-/// let pack_usize = pack_to_int!(usize; bytes; 17);
-///
-/// assert_eq!(pack_usize, 0x12301);
-///
-/// let pack_u64_general = pack_to_int!(u64; bytes; 48);
-///
-/// let pack_u64_general_u64 = pack_to_int!(bytes_u64; 48);
-///
-/// let pack_u64_unrolled = pack_to_int!(u64;
-///     bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
-/// );
-///
-/// let pack_u64_unrolled_u64 = pack_to_int!(
-///     bytes_u64[0], bytes_u64[1], bytes_u64[2], bytes_u64[3], bytes_u64[4], bytes_u64[5]
-/// );
-///
-/// let pack_u64_unrolled_bytes = pack_to_int!(u64;
-///     0x01, 0x23, 0x45, 0x67, 0x89, 0xAB
-/// );
-///
-/// let pack_u64_unrolled_u64_bytes = pack_to_int!(
-///     0x01u64, 0x23, 0x45, 0x67, 0x89, 0xAB
-/// );
-///
-/// assert_eq!(pack_u64_general, 0xAB8967452301);
-/// assert_eq!(pack_u64_general, pack_u64_general_u64);
-/// assert_eq!(pack_u64_general, pack_u64_unrolled);
-/// assert_eq!(pack_u64_general, pack_u64_unrolled_u64);
-/// assert_eq!(pack_u64_general, pack_u64_unrolled_bytes);
-/// assert_eq!(pack_u64_general, pack_u64_unrolled_u64_bytes);
-/// ```
-///
-/// ```should_panic
-/// # use bit_byte_bit::{pack_to_int};
-/// let bytes = vec![0x01, 0x23];
-///
-/// // panics since `bytes.len() == 2` and 8 bytes are expected
-/// let pack_u16 = pack_to_int!(u64; bytes; 64);
-/// ```
-
-/// ```should_panic
-/// # use bit_byte_bit::{pack_to_int};
-/// let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
-///
-/// // panics because of eventual left shift with overflow due to treating a
-/// // u16 value as if it had 64 bits.
-/// let pack_u16 = pack_to_int!(u16; bytes; 64);
-/// ```
-#[macro_export]
-macro_rules! pack_to_int {
-    ($int:ty; $bytes:expr; $length_in_bits:expr) =>{{
-        if $length_in_bits == 0 {
-            0
-        } else {
-            let (sat_length, mask) = if $length_in_bits >= 64 {
-                (64, 0xFFFFFFFFFFFFFFFFu64 as $int)
-            } else {
-                ($length_in_bits, ((1u64 << $length_in_bits) - 1) as $int)
-            };
-
-            let packed = match sat_length {
-                n if n <= 8 => $bytes[0] as $int,
-                n if n <= 16 => pack_to_int!($int; $bytes[0], $bytes[1]),
-                n if n <= 24 => pack_to_int!($int; $bytes[0], $bytes[1], $bytes[2]),
-                n if n <= 32 => pack_to_int!($int; $bytes[0], $bytes[1], $bytes[2], $bytes[3]),
-                n if n <= 40 => pack_to_int!($int;
-                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4]
-                ),
-                n if n <= 48 => pack_to_int!($int;
-                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5]
-                ),
-                n if n <= 56 => pack_to_int!($int;
-                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5], $bytes[6]
-                ),
-                _ => pack_to_int!($int;
-                    $bytes[0], $bytes[1], $bytes[2], $bytes[3],
-                    $bytes[4], $bytes[5], $bytes[6], $bytes[7]
-                )
-            };
-
-            packed & mask
-        }
-    }};
-    ($ty:ty; $b0:expr, $b1:expr) =>{ ($b0 as $ty) | (($b1 as $ty) << 8) };
-    ($ty:ty; $b0:expr, $b1:expr, $b2:expr) => {
-        pack_to_int!($ty; $b0, $b1) | (($b2 as $ty) << 16)
-    };
-    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr) => {
-        pack_to_int!($ty; $b0, $b1, $b2) | (($b3 as $ty) << 24)
-    };
-    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr) => {
-        pack_to_int!($ty; $b0, $b1, $b2, $b3) | (($b4 as $ty) << 32)
-    };
-    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr) => {
-        pack_to_int!($ty; $b0, $b1, $b2, $b3, $b4) | (($b5 as $ty) << 40)
-    };
-    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr) => {
-        pack_to_int!($ty; $b0, $b1, $b2, $b3, $b4, $b5) | (($b6 as $ty) << 48)
-    };
-    ($ty:ty; $b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr, $b7:expr) => {
-        pack_to_int!($ty; $b0, $b1, $b2, $b3, $b4, $b5, $b6) | (($b7 as $ty) << 56)
-    };
-    ($bytes:expr; $length_in_bits:expr) =>{{
-        if $length_in_bits == 0 {
-            0
-        } else {
-            let (sat_length, mask) = if $length_in_bits >= 64 {
-                (64, 0xFFFFFFFFFFFFFFFFu64)
-            } else {
-                ($length_in_bits, ((1 << $length_in_bits) - 1))
-            };
-
-            let packed = match sat_length {
-                n if n <= 8 => $bytes[0],
-                n if n <= 16 => pack_to_int!($bytes[0], $bytes[1]),
-                n if n <= 24 => pack_to_int!($bytes[0], $bytes[1], $bytes[2]),
-                n if n <= 32 => pack_to_int!($bytes[0], $bytes[1], $bytes[2], $bytes[3]),
-                n if n <= 40 => pack_to_int!($bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4]),
-                n if n <= 48 => pack_to_int!(
-                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5]
-                ),
-                n if n <= 56 => pack_to_int!(
-                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5], $bytes[6]
-                ),
-                _ => pack_to_int!(
-                    $bytes[0], $bytes[1], $bytes[2], $bytes[3],
-                    $bytes[4], $bytes[5], $bytes[6], $bytes[7]
-                )
-            };
-
-            packed & mask
-        }
-    }};
-    ($b0:expr, $b1:expr) =>{ $b0 | ( $b1 << 8) };
-    ($b0:expr, $b1:expr, $b2:expr) => { pack_to_int!($b0, $b1) | ($b2 << 16) };
-    ($b0:expr, $b1:expr, $b2:expr, $b3:expr) => { pack_to_int!($b0, $b1, $b2) | ($b3 << 24) };
-    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr) => { 
-        pack_to_int!($b0, $b1, $b2, $b3) | ($b4 << 32)
-    };
-    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr) => {
-        pack_to_int!($b0, $b1, $b2, $b3, $b4) | ($b5 << 40)
-    };
-    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr) => {
-        pack_to_int!($b0, $b1, $b2, $b3, $b4, $b5) | ($b6 << 48)
-    };
-    ($b0:expr, $b1:expr, $b2:expr, $b3:expr, $b4:expr, $b5:expr, $b6:expr, $b7:expr) => {
-        pack_to_int!($b0, $b1, $b2, $b3, $b4, $b5, $b6) | ($b7 << 56)
-    }
-}
+unsafe impl Sync for Bits {}
