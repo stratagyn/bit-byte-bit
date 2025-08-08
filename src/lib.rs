@@ -168,6 +168,93 @@
 //! assert_eq!(ushorts_iter.next(), Some(0xDCBA));
 //! assert_eq!(ushorts_iter.next(), Some(0x00FE));
 //! ```
+//! 
+//! # Bit Schemes
+//! 
+//! [Scheme](/bit-byte-bit/reference/scheme.md) implements a simple bit string pattern matcher inspired by Erlang's
+//! bit syntax. Schemes are used to give meaning to different regions of a bit string.
+//! 
+//! ### Example
+//! 
+//! ---
+//! 
+//! `ipv4_header_scheme` will define the part of the IPv4 datagram header that does not include the options.
+//! This scheme will then be used to process more bits from the bit string. `Scheme::split_*` methods return a vector
+//! of `Bits` corresponding to each field. `Scheme::extract_from_*` methods return a hashmap, corresponding each
+//! field with a key.
+//! 
+//!```rust
+//! # use std::collections::HashMap;
+//! use std::slice::Iter;
+//! # use bit_byte_bit::{Bits, bits_as, Field, Scheme};
+//!
+//! const IPV4_HEADER_BIT_LEN: usize = 160;
+//! const IPV4_HEADER_BYTE_LEN: usize = 20;
+//!
+//! const IPV4_HEADER_KEYS: [&str; 13] = [
+//!     "Version",
+//!     "IHL",
+//!     "DSCP",
+//!     "ECN",
+//!     "Total Length",
+//!     "Identification",
+//!     "Flags",
+//!     "Fragment Offset",
+//!     "TTL",
+//!     "Protocol",
+//!     "Header Checksum",
+//!     "Source Address",
+//!     "Destination Address"
+//! ];
+//!
+//! let ipv4_header_scheme: Scheme = Scheme::new([ 
+//!     Field::UNSIGNED_4,    // Version
+//!     Field::UNSIGNED_4,    // Internet Header Length
+//!     Field::unsigned(6),   // Differentiated Services Code Point
+//!     Field::UNSIGNED_2,    // Explicit Congestion Notification
+//!     Field::UNSIGNED_16,   // Total length
+//!     Field::UNSIGNED_16,   // Identification
+//!     Field::unsigned(3),   // Flags
+//!     Field::unsigned(13),  // Fragment Offset
+//!     Field::UNSIGNED_8,    // Time To Live
+//!     Field::UNSIGNED_8,    // Protocol
+//!     Field::UNSIGNED_16,   // Header Checksum
+//!     Field::UNSIGNED_32,   // Source Address
+//!     Field::UNSIGNED_32    // Destination Address
+//! ]);
+//!
+//! let bits = Bits::new([
+//! 0x54, 0x00, 0x34, 0x00, 0x16, 0x41, 0x02, 0x00,
+//! 128, 6, 0, 0, 192, 168, 5, 45, 91, 198, 174, 192
+//! ]);
+//!
+//! let mut data = ipv4_header_scheme.extract_from_bits(&bits, &IPV4_HEADER_KEYS);
+//!
+//! let total_length = bits_as::unsigned(&data[&"Total Length"]);
+//! let header_32_bit_len = bits_as::unsigned(&data[&"IHL"]);
+//! let options_byte_len = (header_32_bit_len - 5) * 4;
+//! let options_bit_len = options_byte_len * 8;
+//! let options = Bits::take(bits.bytes(), IPV4_HEADER_BIT_LEN, options_bit_len);
+//! let payload_start = IPV4_HEADER_BIT_LEN + options_bit_len;
+//! let payload_bit_len = (total_length - IPV4_HEADER_BYTE_LEN - options_byte_len) * 8;
+//! let payload = Bits::take(bits.bytes(), IPV4_HEADER_BIT_LEN + options_bit_len, payload_bit_len);
+//!
+//! assert_eq!(bits_as::uint8(&data[&"Version"]), 4);
+//! assert_eq!(bits_as::uint8(&data[&"IHL"]), 5);
+//! assert_eq!(bits_as::uint8(&data[&"DSCP"]), 0);
+//! assert_eq!(bits_as::uint8(&data[&"ECN"]), 0);
+//! assert_eq!(bits_as::uint16(&data[&"Total Length"]), 52);
+//! assert_eq!(bits_as::uint16(&data[&"Identification"]), 0x4116);
+//! assert_eq!(bits_as::uint8(&data[&"Flags"]), 2);
+//! assert_eq!(bits_as::uint16(&data[&"Fragment Offset"]), 0);
+//! assert_eq!(bits_as::uint8(&data[&"TTL"]), 128);
+//! assert_eq!(bits_as::uint8(&data[&"Protocol"]), 6);
+//! assert_eq!(bits_as::uint16(&data[&"Header Checksum"]), 0);
+//! assert_eq!(bits_as::vec_u8(&data[&"Source Address"]), vec![192, 168, 5, 45]);
+//! assert_eq!(bits_as::vec_u8(&data[&"Destination Address"]), vec![91, 198, 174, 192]);
+//! assert_eq!(options, Bits::empty());
+//! assert_eq!(payload, Bits::zeros(8 * 32));
+//! ```
 
 mod scheme;
 mod conversion;
@@ -340,6 +427,8 @@ pub(crate) fn get_bits(src: &[u8], start: usize, length: usize) -> Vec<u8> {
     let mut bytes = vec![0; nbytes];
     let take_all = nbytes >= (nbytes_src - start_byte);
 
+
+
     if start_idx > 0 {
         let shift_mask = (1 << start_idx) - 1;
         let upper_length = 8 - start_idx;
@@ -352,7 +441,7 @@ pub(crate) fn get_bits(src: &[u8], start: usize, length: usize) -> Vec<u8> {
 
         if take_all { bytes[nbytes_src - start_byte - 1] = src[nbytes_src - 1] >> start_idx; }
     } else {
-        let end_byte = if take_all { nbytes_src } else { nbytes };
+        let end_byte = if take_all { nbytes_src } else { start_byte + nbytes };
 
         for i in start_byte..end_byte { bytes[i - start_byte] = src[i] }
     }
@@ -610,7 +699,9 @@ impl Bits {
 
         let nbytes_src = src.len();
 
-        if nbytes_src == 0 || start >= (nbytes_src << 3) { return Bits::zeros(length); }
+        if nbytes_src == 0 || start >= (nbytes_src << 3) {
+            return Bits::zeros(length);
+        }
 
         let (nbytes, overflow) = divrem8!(ceil; length);
         let mut bytes = get_bits(src, start, length);
@@ -1074,6 +1165,80 @@ impl Bits {
             }
         }
     }
+
+    /// Creates a bit string by copying a range of bits.
+    ///
+    /// The range is truncated to take no more than the number of available bits from the
+    /// starting bound. For alternative behavior, consider [Bits::take], which pads zeros
+    /// when the length exceeds the number of available bits.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let x1 = Bits::empty();
+    /// let x1_r1 = x1.copy_range(1..18);
+    ///
+    /// assert_eq!(x1_r1, Bits::empty());
+    ///
+    /// let x2 = Bits::zeros(24);
+    /// let x2_r1 = x2.copy_range(8..24);
+    /// let x2_r2 = x2.copy_range(8..=23);
+    ///
+    /// assert_eq!(x2_r1, Bits::zeros(16));
+    /// assert_eq!(x2_r2, x2_r1);
+    ///
+    /// let x3 = Bits::from([0x0A, 0x0B, 0x0C]);
+    /// let x3_r1 = x3.copy_range(1..2);
+    ///
+    /// assert_eq!(x3_r1, Bits::from([0x01]));
+    ///
+    /// let x3_r2 = x3.copy_range(0..);
+    /// let x3_r3 = x3.copy_range(..);
+    ///
+    /// assert_eq!(x3_r2, x3);
+    /// assert_eq!(x3_r3, x3_r2);
+    ///
+    /// let x3_r4 = x3.copy_range(..32);
+    ///
+    /// assert_eq!(x3_r4, Bits::from([0x0A, 0x0B, 0x0C]));
+    /// assert_eq!(x3_r4.len(), 20);
+    ///
+    /// let x3_r5 = x3.copy_range(18..32);
+    ///
+    /// assert_eq!(x3_r5, Bits::from([0x3]));
+    /// assert_eq!(x3_r5.len(), 2);
+    ///
+    /// let x3_r6 = x3.copy_range(8..0);
+    ///
+    /// assert_eq!(x3_r6, Bits::empty());
+    /// ```
+    pub fn copy_range<R: RangeBounds<usize>>(&self, bounds: R) -> Self {
+        if let Bound::Excluded(&usize::MAX) = bounds.start_bound() {
+            return Bits::empty();
+        } else if let Bound::Excluded(&0) = bounds.end_bound() {
+            return Bits::empty();
+        }
+
+        let start = match bounds.start_bound() {
+            Bound::Included(n) if *n < self.nbits => *n,
+            Bound::Unbounded => 0,
+            Bound::Excluded(n) if *n < self.nbits => *n + 1,
+            _ => self.nbits,
+        };
+
+        let end = match bounds.end_bound() {
+            Bound::Excluded(n) if *n < self.nbits => *n,
+            Bound::Included(n) if *n < self.nbits => *n + 1,
+            _ => self.nbits,
+        };
+
+        if start >= end {
+            Bits::empty()
+        } else {
+            Bits::take(self.bytes(), start, end - start)
+        }
+    }
+
 
     /// Adds upper bit padding to a bit string.
     ///
@@ -2878,79 +3043,6 @@ impl Bits {
     /// assert_eq!(x2.len(), 24);
     /// ```
     pub fn xor_mut(&mut self, rhs: &Bits) { bitop!(assign; self, ^=, rhs) }
-
-    /// Creates a bit string by copying a range of bits.
-    ///
-    /// The range is truncated to take no more than the number of available bits from the
-    /// starting bound. For alternative behavior, consider [Bits::take], which pads zeros
-    /// when the length exceeds the number of available bits.
-    ///
-    /// # Examples
-    /// ```
-    /// # use bit_byte_bit::{Bits};
-    /// let x1 = Bits::empty();
-    /// let x1_r1 = x1.xrange(1..18);
-    ///
-    /// assert_eq!(x1_r1, Bits::empty());
-    ///
-    /// let x2 = Bits::zeros(24);
-    /// let x2_r1 = x2.xrange(8..24);
-    /// let x2_r2 = x2.xrange(8..=23);
-    ///
-    /// assert_eq!(x2_r1, Bits::zeros(16));
-    /// assert_eq!(x2_r2, x2_r1);
-    ///
-    /// let x3 = Bits::from([0x0A, 0x0B, 0x0C]);
-    /// let x3_r1 = x3.xrange(1..2);
-    ///
-    /// assert_eq!(x3_r1, Bits::from([0x01]));
-    ///
-    /// let x3_r2 = x3.xrange(0..);
-    /// let x3_r3 = x3.xrange(..);
-    ///
-    /// assert_eq!(x3_r2, x3);
-    /// assert_eq!(x3_r3, x3_r2);
-    ///
-    /// let x3_r4 = x3.xrange(..32);
-    ///
-    /// assert_eq!(x3_r4, Bits::from([0x0A, 0x0B, 0x0C]));
-    /// assert_eq!(x3_r4.len(), 20);
-    ///
-    /// let x3_r5 = x3.xrange(18..32);
-    ///
-    /// assert_eq!(x3_r5, Bits::from([0x3]));
-    /// assert_eq!(x3_r5.len(), 2);
-    ///
-    /// let x3_r6 = x3.xrange(8..0);
-    ///
-    /// assert_eq!(x3_r6, Bits::empty());
-    /// ```
-    pub fn xrange<R: RangeBounds<usize>>(&self, bounds: R) -> Self {
-        if let Bound::Excluded(&usize::MAX) = bounds.start_bound() {
-            return Bits::empty();
-        } else if let Bound::Excluded(&0) = bounds.end_bound() {
-            return Bits::empty();
-        }
-
-        let start = match bounds.start_bound() {
-            Bound::Included(n) if *n < self.nbits => *n,
-            Bound::Unbounded => 0,
-            Bound::Excluded(n) if *n < self.nbits => *n + 1,
-            _ => self.nbits,
-        };
-
-        let end = match bounds.end_bound() {
-            Bound::Excluded(n) if *n < self.nbits => *n,
-            Bound::Included(n) if *n < self.nbits => *n + 1,
-            _ => self.nbits,
-        };
-
-        if start >= end {
-            Bits::empty()
-        } else {
-            Bits::take(self.bytes(), start, end - start)
-        }
-    }
 
     fn cons_bit(&mut self, nbits: usize, fill: u8) {
         unsafe {

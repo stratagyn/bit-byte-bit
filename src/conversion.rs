@@ -1,6 +1,102 @@
 use crate::{Bits};
 
 
+macro_rules! pack_bytes {
+    (4; $bytes:expr, $i:expr) => {
+        pack_to_int!(u64; $bytes[$i], $bytes[$i + 1], $bytes[$i + 2], $bytes[$i + 3])
+    };
+    (8; $bytes:expr, $i:expr) => {
+        pack_to_int!(u64;
+            $bytes[$i], $bytes[$i + 1], $bytes[$i + 2], $bytes[$i + 3],
+            $bytes[$i + 4], $bytes[$i + 5], $bytes[$i + 6], $bytes[$i + 7]
+        )
+    };
+    ($ty:ty; $bytes:expr) => {
+        match <$ty>::BITS {
+            32 => match $bytes.len() {
+                0 => 0,
+                1 => $bytes[0] as $ty,
+                2 => pack_to_int!($ty; $bytes[0], $bytes[1]),
+                3 => pack_to_int!($ty; $bytes[0], $bytes[1], $bytes[2]),
+                _ => pack_to_int!($ty; $bytes[0], $bytes[1], $bytes[2], $bytes[3])
+            },
+            _ => match $bytes.len() {
+                0 => 0,
+                1 => $bytes[0] as $ty,
+                2 => pack_to_int!($ty; $bytes[0], $bytes[1]),
+                3 => pack_to_int!($ty; $bytes[0], $bytes[1], $bytes[2]),
+                4 => pack_to_int!($ty; $bytes[0], $bytes[1], $bytes[2], $bytes[3]),
+                5 => pack_to_int!($ty; $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4]),
+                6 => pack_to_int!($ty;
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5]
+                ),
+                7 => pack_to_int!($ty;
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3], $bytes[4], $bytes[5], $bytes[6]
+                ),
+                _ => pack_to_int!($ty;
+                    $bytes[0], $bytes[1], $bytes[2], $bytes[3],
+                    $bytes[4], $bytes[5], $bytes[6], $bytes[7]
+                )
+            }
+        }
+    };
+    ($ty:ty, $ty_nbits:tt, $ty_nbytes:tt, $ty_pow2:literal; $bits:expr) => {{
+        if $bits.nbits == 0 { return vec![]; }
+
+        let bytes = $bits.bytes();
+        let bytes_len = bytes.len();
+        let mut packed = Vec::with_capacity(((bytes_len - 1) >> $ty_pow2) + 1);
+        let remaining_byte_len = bytes_len & ($ty_nbytes - 1);
+        let max_byte = bytes_len - remaining_byte_len;
+
+        for i in (0..max_byte).step_by($ty_nbytes) {
+            packed.push(pack_bytes!($ty_nbytes; bytes, i) as $ty);
+        }
+
+        if remaining_byte_len > 0 {
+            let remaining_bytes = &bytes[max_byte..];
+            let remaining_bit_len = remaining_byte_len << 3;
+            
+            packed.push(pack_to_int!($ty; remaining_bytes; remaining_bit_len; $ty_nbits));
+        }
+
+        packed
+    }};
+    ($ty:ty, $ity:ty, $uty_nbits:tt, $uty_nbytes:tt, $uty_pow2:literal; $bits:expr) => {{
+        if $bits.nbits == 0 { return vec![]; }
+
+        let bytes = $bits.bytes();
+        let bytes_len = bytes.len();
+        let mut packed = Vec::with_capacity(((bytes_len - 1) >> $uty_pow2) + 1);
+        let remaining_byte_len = bytes_len & ($uty_nbytes - 1);
+        let max_byte = bytes_len - remaining_byte_len;
+
+        for i in (0..max_byte).step_by($uty_nbytes) {
+            packed.push(pack_bytes!($uty_nbytes; bytes, i) as $ty);
+        }
+
+        if remaining_byte_len == 0 && $bits.padding == 0 { return packed; }
+
+        let overflow = 8 - $bits.padding;
+
+        let (last_bytes, length) = if remaining_byte_len == 0 {
+            (packed.pop().unwrap() as $ity, $uty_nbits - 8 + overflow)
+        } else {
+            let remaining_bytes = &bytes[max_byte..];
+            let remaining_bit_len = remaining_byte_len << 3;
+
+            (
+                pack_to_int!($ity; remaining_bytes; remaining_bit_len; $uty_nbits),
+                ((remaining_byte_len - 1) << 3) + overflow
+            )
+        };
+
+        packed.push(sign_extend!(last_bytes, length) as $ty);
+
+        packed
+    }}
+}
+
 macro_rules! pack_to_int {
     ($int:ty; $bytes:expr; $length_in_bits:expr; 16) =>{{
         if $length_in_bits == 0 {
@@ -178,15 +274,6 @@ macro_rules! pack_to_int {
     }
 }
 
-macro_rules! pack_8_bytes {
-    ($bytes:expr, $i:expr) => {
-        pack_to_int!(u64;
-            $bytes[$i], $bytes[$i + 1], $bytes[$i + 2], $bytes[$i + 3],
-            $bytes[$i + 4], $bytes[$i + 5], $bytes[$i + 6], $bytes[$i + 7]
-        )
-    }
-}
-
 macro_rules! sign_extend {
     ($n:expr, $bits:expr) => {
         $n | ((signed_bit_mask!($n, $bits) >> $bits) << $bits)
@@ -198,6 +285,7 @@ macro_rules! signed_bit_mask {
         (!(($n >> ($bits - 1)) & 1)).wrapping_add(1)
     };
 }
+
 
 pub mod bits_as {
 
@@ -296,7 +384,7 @@ pub mod bits_as {
         let max_byte = bytes_len - remaining_byte_len;
 
         for i in (0..max_byte).step_by(8) {
-            packed.push(f64::from_bits(pack_8_bytes!(bytes, i)));
+            packed.push(f64::from_bits(pack_bytes!(8; bytes, i)));
         }
 
         if max_byte < bytes_len {
@@ -313,8 +401,8 @@ pub mod bits_as {
 
     /// Converts a bit string to a vector of 8 bit signed integers.
     ///
-    /// If the length of the the bit string is not divisible by 8 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// If the length of the the bit string is not divisible by 8, it is
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -353,7 +441,7 @@ pub mod bits_as {
     /// Converts a bit string to a vector of 16 bit signed integers.
     ///
     /// If the length of the the bit string is not divisible by 16 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -400,7 +488,7 @@ pub mod bits_as {
     /// Converts a bit string to a vector of 32 bit signed integers.
     ///
     /// If the length of the the bit string is not divisible by 32 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -455,7 +543,7 @@ pub mod bits_as {
     /// Converts a bit string to a vector of 64 bit signed integers.
     ///
     /// If the length of the the bit string is not divisible by 64 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -482,7 +570,7 @@ pub mod bits_as {
         let max_byte = bytes_len - remaining_byte_len;
 
         for i in (0..max_byte).step_by(8) {
-            packed.push(pack_8_bytes!(bytes, i) as i64);
+            packed.push(pack_bytes!(8; bytes, i) as i64);
         }
 
         if remaining_byte_len == 0 && bits.padding == 0 { return packed; }
@@ -504,6 +592,33 @@ pub mod bits_as {
         packed.push(sign_extend!(last_bytes, length) as i64);
 
         packed
+    }
+
+    /// Converts a bit string to a vector of signed integers.
+    ///
+    /// If the length of the the bit string is not divisible by the length of `isize`, it is
+    /// sign-extended to the next length that is, then it is converted.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits};
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let signed_ints = bits_as::vec_isize(&bits);
+    ///
+    /// assert_eq!(signed_ints.len(), 1);
+    /// assert_eq!(signed_ints, vec![0x0000000076543210]);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let signed_ints = bits_as::vec_i64(&bits);
+    ///
+    /// assert_eq!(signed_ints.len(), 1);
+    /// assert_eq!(signed_ints, vec![0xFFFFFFFFF6543210u64 as i64]);
+    /// ```
+    pub fn vec_isize(bits: &Bits) -> Vec<isize> {
+        match isize::BITS {
+            32 => pack_bytes!(isize, u32, 32, 4, 2; bits),
+            _ => pack_bytes!(isize, u64, 64, 8, 3; bits),
+        }
     }
 
     /// Converts a bit string to a vector of 8 bit unsigned integers.
@@ -607,7 +722,7 @@ pub mod bits_as {
     /// Converts a bit string to a vector of 64 bit unsigned integers.
     ///
     /// If the length of the the bit string is not divisible by 64 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -634,7 +749,7 @@ pub mod bits_as {
         let max_byte = bytes_len - remaining_byte_len;
 
         for i in (0..max_byte).step_by(8) {
-            packed.push(pack_8_bytes!(bytes, i));
+            packed.push(pack_bytes!(8; bytes, i));
         }
 
         if max_byte < bytes_len {
@@ -647,6 +762,30 @@ pub mod bits_as {
         packed
     }
 
+    /// Converts a bit string to a vector of unsigned integers.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits};
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned_ints = bits_as::vec_usize(&bits);
+    ///
+    /// assert_eq!(unsigned_ints.len(), 1);
+    /// assert_eq!(unsigned_ints, vec![0x0000000076543210]);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned_ints = bits_as::vec_usize(&bits);
+    ///
+    /// assert_eq!(unsigned_ints.len(), 1);
+    /// assert_eq!(unsigned_ints, vec![0x0000000076543210]);
+    /// ```
+    pub fn vec_usize(bits: &Bits) -> Vec<usize> {
+        match usize::BITS {
+            32 => pack_bytes!(usize, 32, 4, 2; bits),
+            _ => pack_bytes!(usize, 64, 8, 3; bits),
+        }
+    }
+    
     /// Converts up to the first 32 bits of a bit string to a 32 bit float
     ///
     /// # Example
@@ -700,14 +839,14 @@ pub mod bits_as {
             4 => f64::from_bits(pack_to_int!(u64; bytes[0], bytes[1], bytes[2], bytes[3])),
             5 => f64::from_bits(pack_to_int!(u64; bytes[0], bytes[1], bytes[2], bytes[3], bytes[4])),
             6 => f64::from_bits(pack_to_int!(u64;
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
-        )),
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+            )),
             7 => f64::from_bits(pack_to_int!(u64;
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]
-        )),
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]
+            )),
             _ => f64::from_bits(pack_to_int!(u64;
-            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
-        ))
+                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+            ))
         }
     }
 
@@ -741,7 +880,7 @@ pub mod bits_as {
                 } else {
                     byte as i8
                 }
-            }
+            },
             _ => bits.words[0] as i8
         }
     }
@@ -765,21 +904,20 @@ pub mod bits_as {
     /// ```
     pub fn int16(bits: &Bits) -> i16 {
         let bytes = bits.bytes();
+        let overflow = 8 - bits.padding;
 
         match bytes.len() {
             0 => 0,
             1 => {
                 let byte = bits.words[0] as u16;
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(byte, overflow) as i16
             },
             2  if bits.padding > 0 => {
                 let bytes = pack_to_int!(u16; bytes[0], bytes[1]);
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(bytes, overflow + 8) as i16
-            }
+            },
             _ => pack_to_int!(u16; bytes[0], bytes[1]) as i16
         }
     }
@@ -803,30 +941,27 @@ pub mod bits_as {
     /// ```
     pub fn int32(bits: &Bits) -> i32 {
         let bytes = bits.bytes();
+        let overflow = 8 - bits.padding;
 
         match bytes.len() {
             0 => 0,
             1 => {
                 let byte = bits.words[0] as u32;
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(byte, overflow) as i32
             },
             2 => {
                 let packed_bytes = pack_to_int!(u32; bytes[0], bytes[1]);
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(packed_bytes, overflow + 8) as i32
             }
             3 => {
                 let packed_bytes = pack_to_int!(u32; bytes[0], bytes[1], bytes[2]);
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(packed_bytes, overflow + 16) as i32
             }
             4 if bits.padding > 0 => {
                 let packed_bytes = pack_to_int!(u32; bytes[0], bytes[1], bytes[2], bytes[3]);
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(packed_bytes, overflow + 24) as i32
             }
@@ -853,72 +988,92 @@ pub mod bits_as {
     /// ```
     pub fn int64(bits: &Bits) -> i64 {
         let bytes = bits.bytes();
+        let overflow = 8 - bits.padding;
 
         match bytes.len() {
             0 => 0,
             1 => {
                 let byte = bits.words[0] as u64;
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(byte, overflow) as i64
             },
             2 => {
                 let packed_bytes = pack_to_int!(u64; bytes[0], bytes[1]);
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(packed_bytes, overflow + 8) as i64
             },
             3 => {
                 let packed_bytes = pack_to_int!(u64; bytes[0], bytes[1], bytes[2]);
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(packed_bytes, overflow + 16) as i64
             },
             4 => {
                 let packed_bytes = pack_to_int!(u64; bytes[0], bytes[1], bytes[2], bytes[3]);
-                let overflow = 8 - bits.padding;
 
                 sign_extend!(packed_bytes, overflow + 24) as i64
             },
             5 => {
                 let packed_bytes = pack_to_int!(u64;
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]
-            );
-
-                let overflow = 8 - bits.padding;
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4]
+                );
 
                 sign_extend!(packed_bytes, overflow + 32) as i64
             },
             6 => {
                 let packed_bytes = pack_to_int!(u64;
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
-            );
-
-                let overflow = 8 - bits.padding;
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5]
+                );
 
                 sign_extend!(packed_bytes, overflow + 40) as i64
             },
             7 => {
                 let packed_bytes = pack_to_int!(u64;
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]
-            );
-
-                let overflow = 8 - bits.padding;
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6]
+                );
 
                 sign_extend!(packed_bytes, overflow + 48) as i64
             },
             8 if bits.padding > 0 => {
                 let packed_bytes = pack_to_int!(u64;
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
-            );
-
-                let overflow = 8 - bits.padding;
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
+                );
 
                 sign_extend!(packed_bytes, overflow + 56) as i64
             },
             _ => pack_to_int!(u64;
                 bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
             ) as i64
+        }
+    }
+
+    /// Converts up to the first 64 bits of a bit string to a signed integer.
+    ///
+    /// If the length of the the bit string is less than the length of `isize`, the result is
+    /// sign-extended to 64 bits.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits};
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let signed = bits_as::signed(&bits);
+    ///
+    /// assert_eq!(signed, 0x0000000076543210);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let signed = bits_as::signed(&bits);
+    ///
+    /// assert_eq!(signed, 0xFFFFFFFFF6543210u64 as isize);
+    /// ```
+    pub fn signed(bits: &Bits) -> isize {
+        let bytes = bits.bytes();
+        let bytes_len = bytes.len();
+        let packed_bytes = pack_bytes!(usize; bytes);
+        let overflow = 8 - bits.padding;
+
+        if (isize::BITS == 32 && bytes_len < 4) || (isize::BITS == 64 && bytes_len < 8) {
+            sign_extend!(packed_bytes, overflow + ((bytes_len - 1) << 3)) as isize
+        } else {
+            packed_bytes as isize
         }
     }
 
@@ -1025,6 +1180,27 @@ pub mod bits_as {
             )
         }
     }
+
+    /// Converts up to the first 64 bits of a bit string to an unsigned integer.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits};
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned = bits_as::unsigned(&bits);
+    ///
+    /// assert_eq!(unsigned, 0x0000000076543210);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned = bits_as::unsigned(&bits);
+    ///
+    /// assert_eq!(unsigned, 0x0000000076543210);
+    /// ```
+    pub fn unsigned(bits: &Bits) -> usize {
+        let bytes = bits.bytes();
+
+        pack_bytes!(usize; bytes)
+    }
 }
 
 impl From<Bits> for Vec<bool> {
@@ -1094,8 +1270,8 @@ impl From<Bits> for Vec<f64> {
 impl From<Bits> for Vec<i8> {
     /// Converts a bit string to a vector of 8 bit signed integers.
     ///
-    /// If the length of the the bit string is not divisible by 8 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// If the length of the the bit string is not divisible by 8, it is
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -1118,8 +1294,8 @@ impl From<Bits> for Vec<i8> {
 impl From<Bits> for Vec<i16> {
     /// Converts a bit string to a vector of 16 bit signed integers.
     ///
-    /// If the length of the the bit string is not divisible by 16 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// If the length of the the bit string is not divisible by 16, it is
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -1142,8 +1318,8 @@ impl From<Bits> for Vec<i16> {
 impl From<Bits> for Vec<i32> {
     /// Converts a bit string to a vector of 32 bit signed integers.
     ///
-    /// If the length of the the bit string is not divisible by 32 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// If the length of the the bit string is not divisible by 32, it is
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -1166,8 +1342,8 @@ impl From<Bits> for Vec<i32> {
 impl From<Bits> for Vec<i64> {
     /// Converts a bit string to a vector of 64 bit signed integers.
     ///
-    /// If the length of the the bit string is not divisible by 64 it is
-    /// sign-extended to the next length that is. Then it is converted.
+    /// If the length of the the bit string is not divisible by 64, it is
+    /// sign-extended to the next length that is, then it is converted.
     ///
     /// # Example
     /// ```
@@ -1187,9 +1363,33 @@ impl From<Bits> for Vec<i64> {
     fn from(bits: Bits) -> Self { bits_as::vec_i64(&bits) }
 }
 
+impl From<Bits> for Vec<isize> {
+    /// Converts a bit string to a vector of signed integers.
+    ///
+    /// If the length of the the bit string is not divisible by the length of `isize`, it is
+    /// sign-extended to the next length that is, then it is converted.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::Bits;
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let signed_ints = Vec::<isize>::from(bits);
+    ///
+    /// assert_eq!(signed_ints.len(), 1);
+    /// assert_eq!(signed_ints, vec![0x0000000076543210]);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let signed_ints = Vec::<isize>::from(bits);
+    ///
+    /// assert_eq!(signed_ints.len(), 1);
+    /// assert_eq!(signed_ints, vec![0xFFFFFFFFF6543210u64 as isize]);
+    /// ```
+    fn from(bits: Bits) -> Self { bits_as::vec_isize(&bits) }
+}
+
 impl From<Bits> for Vec<u8> {
     /// Converts a bit string to a vector of 8 bit unsigned integers.
-    ///
+    /// 
     /// # Example
     /// ```
     /// # use bit_byte_bit::Bits;
@@ -1253,9 +1453,6 @@ impl From<Bits> for Vec<u32> {
 impl From<Bits> for Vec<u64> {
     /// Converts a bit string to a vector of 64 bit unsigned integers.
     ///
-    /// If the length of the the bit string is not divisible by 64 it is
-    /// sign-extended to the next length that is. Then it is converted.
-    ///
     /// # Example
     /// ```
     /// # use bit_byte_bit::Bits;
@@ -1272,6 +1469,27 @@ impl From<Bits> for Vec<u64> {
     /// assert_eq!(ulongs, vec![0x0000000076543210]);
     /// ```
     fn from(bits: Bits) -> Self { bits_as::vec_u64(&bits) }
+}
+
+impl From<Bits> for Vec<usize> {
+    /// Converts a bit string to a vector of unsigned integers.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::Bits;
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned_ints = Vec::<u64>::from(bits);
+    ///
+    /// assert_eq!(unsigned_ints.len(), 1);
+    /// assert_eq!(unsigned_ints, vec![0x0000000076543210]);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned_ints = Vec::<u64>::from(bits);
+    ///
+    /// assert_eq!(unsigned_ints.len(), 1);
+    /// assert_eq!(unsigned_ints, vec![0x0000000076543210]);
+    /// ```
+    fn from(bits: Bits) -> Self { bits_as::vec_usize(&bits) }
 }
 
 impl From<Bits> for f32 {
@@ -1396,6 +1614,28 @@ impl From<Bits> for i64 {
     fn from(bits: Bits) -> Self { bits_as::int64(&bits) }
 }
 
+impl From<Bits> for isize {
+    /// Converts up to the first 64 bits of a bit string to a 64 bit signed integer.
+    ///
+    /// If the length of the the bit string is less than the length of `isize`, the result is 
+    /// sign-extended to 64 bits.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::Bits;
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let signed = isize::from(bits);
+    ///
+    /// assert_eq!(signed, 0x0000000076543210);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let signed = isize::from(bits);
+    ///
+    /// assert_eq!(signed, 0xFFFFFFFFF6543210u64 as isize);
+    /// ```
+    fn from(bits: Bits) -> Self { bits_as::signed(&bits) }
+}
+
 impl From<Bits> for u8 {
     /// Converts up to the first 8 bits of a bit string to a 8 bit unsigned integer.
     ///
@@ -1470,4 +1710,23 @@ impl From<Bits> for u64 {
     /// assert_eq!(ulong, 0x0000000076543210);
     /// ```
     fn from(bits: Bits) -> Self { bits_as::uint64(&bits) }
+}
+
+impl From<Bits> for usize {
+    /// Converts up to the first 64 bits of a bit string to an unsigned integer.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::Bits;
+    /// let bits = Bits::new([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned = usize::from(bits);
+    ///
+    /// assert_eq!(unsigned, 0x0000000076543210);
+    ///
+    /// let bits = Bits::from([0x10, 0x32, 0x54, 0x76]);
+    /// let unsigned = usize::from(bits);
+    ///
+    /// assert_eq!(unsigned, 0x0000000076543210);
+    /// ```
+    fn from(bits: Bits) -> Self { bits_as::unsigned(&bits) }
 }

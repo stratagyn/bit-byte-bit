@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt::{Debug};
+use std::hash::Hash;
 use crate::{Bits};
 
 
@@ -383,6 +385,171 @@ impl Scheme {
         acc
     }
 
+    /// Extracts the data associated with the fields of this scheme, associating each with a key.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits, Field, Scheme};
+    ///
+    /// let unsigned_3 = Field::unsigned(3);
+    ///
+    /// let scheme = Scheme::new([
+    ///     Field::signed(5), Field::BIT, unsigned_3, unsigned_3, Field::UNSIGNED_4
+    /// ]);
+    ///
+    /// let bits = Bits::new([0xBA, 0x1C]);
+    ///
+    /// let parts = scheme.extract_from_bits(
+    ///     &bits,
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    ///
+    /// assert_eq!(bits_as::int8(&parts["opcode"]), -6);
+    /// assert_eq!(bits_as::uint8(&parts["flag"]), 1);
+    /// assert_eq!(bits_as::uint8(&parts["destination_register"]), 2);
+    /// assert_eq!(bits_as::uint8(&parts["source_register"]), 6);
+    /// assert_eq!(bits_as::uint8(&parts["constant"]), 1);
+    ///
+    /// let bits = Bits::new([0xBA]);
+    ///
+    /// let parts = scheme.extract_from_bits(
+    ///     &bits,
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    ///
+    /// assert_eq!(bits_as::int8(&parts["opcode"]), -6);
+    /// assert_eq!(bits_as::uint8(&parts["flag"]), 1);
+    /// assert_eq!(bits_as::uint8(&parts["destination_register"]), 2);
+    /// assert_eq!(bits_as::uint8(&parts["source_register"]), 0);
+    /// assert_eq!(bits_as::uint8(&parts["constant"]), 0);
+    /// ```
+    pub fn extract_from_bits<K, I>(&self, bits: &Bits, keys: I) -> HashMap<K, Bits>
+    where K: Eq + Hash, I: IntoIterator<Item=K> {
+        keys.into_iter().zip(self.split_bits_at(0, bits)).collect()
+    }
+
+    /// Extracts the data associated with the fields of this scheme.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits, Field, Scheme};
+    ///
+    /// let unsigned_3 = Field::unsigned(3);
+    ///
+    /// let scheme = Scheme::new([
+    ///     Field::signed(5), Field::BIT, unsigned_3, unsigned_3, Field::UNSIGNED_4
+    /// ]);
+    ///
+    /// let bits = Bits::new([0xBA, 0x1C]);
+    ///
+    /// let parts = scheme.extract_from_bits_at(
+    ///     0,
+    ///     &bits,
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    ///
+    /// assert_eq!(bits_as::int8(&parts["opcode"]), -6);
+    /// assert_eq!(bits_as::uint8(&parts["flag"]), 1);
+    /// assert_eq!(bits_as::uint8(&parts["destination_register"]), 2);
+    /// assert_eq!(bits_as::uint8(&parts["source_register"]), 6);
+    /// assert_eq!(bits_as::uint8(&parts["constant"]), 1);
+    ///
+    /// let parts = scheme.extract_from_bits_at(
+    ///     8,
+    ///     &bits,
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    ///
+    /// assert_eq!(bits_as::int8(&parts["opcode"]), -4);
+    /// assert_eq!(bits_as::uint8(&parts["flag"]), 0);
+    /// assert_eq!(bits_as::uint8(&parts["destination_register"]), 0);
+    /// assert_eq!(bits_as::uint8(&parts["source_register"]), 0);
+    /// assert_eq!(bits_as::uint8(&parts["constant"]), 0);
+    /// ```
+    pub fn extract_from_bits_at<K, I>(&self, index: usize, bits: &Bits, keys: I) -> HashMap<K, Bits>
+    where K: Eq + Hash, I: IntoIterator<Item=K> {
+        keys.into_iter().zip(self.split_bits_at(index, bits)).collect()
+    }
+
+    /// Extracts the data associated with the fields of this scheme
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits, Field, Scheme};
+    ///
+    /// let unsigned_3 = Field::unsigned(3);
+    ///
+    /// let scheme = Scheme::new([
+    ///     Field::signed(5), Field::BIT, unsigned_3, unsigned_3, Field::UNSIGNED_4
+    /// ]);
+    ///
+    /// let parts = scheme.extract_from_bytes(
+    ///     [0xBA, 0x1C],
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    ///
+    /// assert_eq!(bits_as::int8(&parts["opcode"]), -6);
+    /// assert_eq!(bits_as::uint8(&parts["flag"]), 1);
+    /// assert_eq!(bits_as::uint8(&parts["destination_register"]), 2);
+    /// assert_eq!(bits_as::uint8(&parts["source_register"]), 6);
+    /// assert_eq!(bits_as::uint8(&parts["constant"]), 1);
+    ///
+    /// let parts = scheme.extract_from_bytes(
+    ///     [0xBA],
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    /// ```
+    pub fn extract_from_bytes<K, IB, IK>(&self, bytes: IB, keys: IK) -> HashMap<K, Bits>
+    where K: Eq + Hash, IB: IntoIterator<Item=u8>, IK: IntoIterator<Item=K> {
+        keys.into_iter().zip(self.split_bytes_at(0, bytes)).collect()
+    }
+
+    /// Extracts the data associated with the fields of this scheme.
+    ///
+    /// # Example
+    /// ```
+    /// # use bit_byte_bit::{bits_as, Bits, Field, Scheme};
+    ///
+    /// let unsigned_3 = Field::unsigned(3);
+    ///
+    /// let scheme = Scheme::new([
+    ///     Field::signed(5), Field::BIT, unsigned_3, unsigned_3, Field::UNSIGNED_4
+    /// ]);
+    ///
+    /// let parts = scheme.extract_from_bytes_at(
+    ///     0,
+    ///     [0xBA, 0x1C],
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    ///
+    /// assert_eq!(bits_as::int8(&parts["opcode"]), -6);
+    /// assert_eq!(bits_as::uint8(&parts["flag"]), 1);
+    /// assert_eq!(bits_as::uint8(&parts["destination_register"]), 2);
+    /// assert_eq!(bits_as::uint8(&parts["source_register"]), 6);
+    /// assert_eq!(bits_as::uint8(&parts["constant"]), 1);
+    ///
+    /// let parts = scheme.extract_from_bytes_at(
+    ///     8,
+    ///     [0xBA, 0x1C],
+    ///     ["opcode", "flag", "destination_register", "source_register", "constant"]
+    /// );
+    ///
+    /// assert_eq!(bits_as::int8(&parts["opcode"]), -4);
+    /// assert_eq!(bits_as::uint8(&parts["flag"]), 0);
+    /// assert_eq!(bits_as::uint8(&parts["destination_register"]), 0);
+    /// assert_eq!(bits_as::uint8(&parts["source_register"]), 0);
+    /// assert_eq!(bits_as::uint8(&parts["constant"]), 0);
+    /// ```
+    pub fn extract_from_bytes_at<K, IB, IK>(
+        &self,
+        index: usize,
+        bytes: IB,
+        keys: IK
+    ) -> HashMap<K, Bits>
+    where K: Eq + Hash, IB: IntoIterator<Item=u8>, IK: IntoIterator<Item=K> {
+        keys.into_iter().zip(self.split_bytes_at(index, bytes)).collect()
+    }
+    
     /// Extracts the data associated with the fields of this scheme
     ///
     /// # Example
@@ -518,7 +685,6 @@ impl Scheme {
                 matches.push(field.default());
             } else {
                 let data = field.extract(&bits, length, index);
-
                 index += data.len();
                 matches.push(data);
             }
