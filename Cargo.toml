@@ -1,10 +1,9 @@
 [package]
 name = "bit-byte-bit"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Implements a bit string using a collection of bytes."
 readme = "README.md"
-documentation = "https://stratagyn.github.io/bit-byte-bit"
 repository = "https://github.com/stratagyn/bit-byte-bit"
 license = "MIT OR Apache-2.0"
 keywords = ["bitarray", "bitstring", "bits", "bytearray", "bytes"]

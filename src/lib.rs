@@ -184,8 +184,6 @@
 //! field with a key.
 //! 
 //!```rust
-//! # use std::collections::HashMap;
-//! use std::slice::Iter;
 //! # use bit_byte_bit::{Bits, bits_as, Field, Scheme};
 //!
 //! const IPV4_HEADER_BIT_LEN: usize = 160;
@@ -224,8 +222,8 @@
 //! ]);
 //!
 //! let bits = Bits::new([
-//! 0x54, 0x00, 0x34, 0x00, 0x16, 0x41, 0x02, 0x00,
-//! 128, 6, 0, 0, 192, 168, 5, 45, 91, 198, 174, 192
+//!    0x54, 0x00, 0x34, 0x00, 0x16, 0x41, 0x02, 0x00,
+//!    128, 6, 0, 0, 192, 168, 5, 45, 91, 198, 174, 192
 //! ]);
 //!
 //! let mut data = ipv4_header_scheme.extract_from_bits(&bits, &IPV4_HEADER_KEYS);
@@ -391,9 +389,7 @@ macro_rules! divrem8 {
 }
 
 macro_rules! mask {
-    ($shift:expr) => {
-        if $shift == 0 { 0xFF } else { ((1 << $shift) - 1) as u8 }
-    };
+    ($shift:expr) => { if $shift == 0 { 0xFF } else { ((1 << $shift) - 1) as u8 } };
 }
 
 macro_rules! pointer {
@@ -416,6 +412,19 @@ macro_rules! pointer {
         for i in 0..$size { ptr::write(pointer.add(i), $fill); }
 
         pointer
+    }};
+}
+
+macro_rules! single_bit_pointer {
+    ($bit:literal) => {{
+        let layout = Layout::array::<u8>(1).unwrap();
+        let pointer = alloc::alloc(layout);
+
+        ptr::write(pointer, $bit);
+
+        let bytes = RawBytes { bytes: NonNull::new(pointer).unwrap(), cap: 1, nbytes: 1 };
+
+        Bits { words: bytes, mask: 1, nbits: 1, padding: 7 }
     }};
 }
 
@@ -585,6 +594,18 @@ impl Bits {
         Bits { words: bytes, mask: 0xFF, nbits: 0, padding: 0 }
     }
 
+    /// Creates a single bit string set to 1.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x = Bits::one();
+    ///
+    /// assert_eq!(x.len(), 1);
+    /// assert_eq!(x, Bits::from([1]));
+    /// ```
+    pub fn one() -> Self { unsafe { single_bit_pointer!(1) } }
+
     /// Creates a bit string of ones.
     ///
     /// # Examples
@@ -598,18 +619,21 @@ impl Bits {
     pub fn ones(length: usize) -> Self {
         match length {
             0 => Bits::empty(),
-            length => unsafe {
+            length => {
                 let nbytes = 1 + ((length - 1) >> 3);
                 let overflow = length & 7;
                 let padding = (8 - overflow) & 7;
                 let mask = mask!(overflow);
-                let pointer = pointer![0xFFu8; nbytes];
 
-                *pointer.add(nbytes - 1) &= mask;
+                unsafe {
+                    let pointer = pointer![0xFFu8; nbytes];
 
-                let bytes = RawBytes { bytes: NonNull::new(pointer).unwrap(), cap: nbytes, nbytes };
+                    *pointer.add(nbytes - 1) &= mask;
 
-                Bits { words: bytes, mask, nbits: length, padding }
+                    let bytes = RawBytes { bytes: NonNull::new(pointer).unwrap(), cap: nbytes, nbytes };
+
+                    Bits { words: bytes, mask, nbits: length, padding }
+                }
             }
         }
     }
@@ -713,6 +737,18 @@ impl Bits {
 
         Bits { words: bytes, mask: mask!(overflow), nbits: length, padding: (8 - overflow) & 7 }
     }
+
+    /// Creates a single bit string set to 0.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x = Bits::zero();
+    ///
+    /// assert_eq!(x.len(), 1);
+    /// assert_eq!(x, Bits::slice(&[0], 1));
+    /// ```
+    pub fn zero() -> Self { unsafe { single_bit_pointer!(0) } }
 
     /// Creates a bit string of zeros.
     ///
@@ -1402,7 +1438,7 @@ impl Bits {
     ///
     /// assert_eq!(ones, 17);
     /// ```
-    pub fn iter(&self) -> Iter { Iter::new(self, 0) }
+    pub fn iter(&'_ self) -> Iter<'_> { Iter::new(self, 0) }
 
     /// An iterator over the individual bits
     ///
@@ -1422,7 +1458,7 @@ impl Bits {
     ///
     /// assert_eq!(ones, 9);
     /// ```
-    pub fn iter_from(&self, index: usize) -> Iter {
+    pub fn iter_from(&'_ self, index: usize) -> Iter<'_> {
         assert!(index <= self.nbits, "Index out of bounds");
 
         Iter::new(self, index)
@@ -2319,40 +2355,33 @@ impl Bits {
     /// assert_eq!(x2.len(), 24);
     /// ```
     pub fn shift_left(&mut self, count: usize) {
-        match (self.size(), count) {
-            (0, _) | (_, 0) => (),
-            (_, count) if count >= self.nbits => unsafe {
-                let pointer = self.words.as_ptr_mut();
+        self.shift_bytes_left_with(count, 0);
+    }
 
-                for i in 0..self.size() { *pointer.add(i) = 0 }
-            },
-            (n, count) => unsafe {
-                let pointer = self.words.as_ptr_mut();
-                let shift_overflow = count & 7;
-                let shift_bytes = count >> 3;
-
-                if shift_bytes > 0 {
-                    ptr::copy(pointer, pointer.add(shift_bytes), self.size() - shift_bytes);
-
-                    for i in 0..shift_bytes { *pointer.add(i) = 0; }
-
-                    *pointer.add(n - 1) &= self.mask;
-                }
-
-                if shift_overflow > 0 {
-                    let low = 8 - shift_overflow;
-
-                    for i in 1..n {
-                        *pointer.add(n - i) <<= shift_overflow;
-                        *pointer.add(i) |= *pointer.add(n - i - 1) >> low;
-                    }
-
-                    *pointer <<= shift_overflow;
-                }
-
-                *pointer.add(n - 1) &= self.mask;
-            }
-        }
+    /// Shifts out upper bits, shifting in zeros or ones on the lower end.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x1 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// x1.shift_left_with(17, false);
+    ///
+    /// assert_eq!(x1, Bits::slice(&[0x00, 0x00, 0x04], 20));
+    /// assert_eq!(x1.len(), 20);
+    ///
+    /// let mut x2 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// // 0101 11111111 11111111
+    /// //
+    ///
+    /// x2.shift_left_with(17, true);
+    ///
+    /// assert_eq!(x2, Bits::slice(&[0xFF, 0xFF, 0x05], 20));
+    /// assert_eq!(x2.len(), 20);
+    /// ```
+    pub fn shift_left_with(&mut self, count: usize, bit: bool) {
+        self.shift_bytes_left_with(count, if bit { 0xFF } else { 0 });
     }
 
     /// Shifts out upper bits, shifting in zeros on the lower end.
@@ -2375,7 +2404,7 @@ impl Bits {
     pub fn shifted_left(&self, count: usize) -> Self {
         let mut clone = self.clone();
 
-        clone.shift_left(count);
+        clone.shift_bytes_left_with(count, 0);
 
         clone
     }
@@ -2400,32 +2429,30 @@ impl Bits {
     /// assert_eq!(x2, Bits::new([0xB0, 0xC0, 0x00]));
     /// ```
     pub fn shift_right(&mut self, count: usize) {
-        match (self.size(), count) {
-            (0, _) | (_, 0) => (),
-            (_, count) if count >= self.nbits => unsafe {
-                let pointer = self.words.as_ptr_mut();
+        self.shift_bytes_right_with(count, 0)
+    }
 
-                for i in 0..self.size() { *pointer.add(i) = 0 }
-            },
-            (n, count) => unsafe {
-                let pointer = self.words.as_ptr_mut();
-                *pointer.add(n - 1) &= self.mask;
-                let nbytes_shift = count >> 3;
-
-                ptr::copy(pointer.add(nbytes_shift), pointer, self.size() - nbytes_shift);
-
-                for i in (self.size() - nbytes_shift)..self.size() { *pointer.add(i) = 0; }
-
-                let overflow = count & 7;
-
-                if overflow > 0 {
-                    let mask = (1 << overflow) - 1;
-                    let low = 8 - overflow;
-
-                    self.words.shift_right(self.size() - nbytes_shift, mask, low, overflow);
-                }
-            }
-        }
+    /// Shifts out lower bits, shifting zeros or ones into the upper bits.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x1 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// x1.shift_right_with(17, false);
+    ///
+    /// assert_eq!(x1.len(), 20);
+    /// assert_eq!(x1, Bits::slice(&[0x06, 0x00, 0x00], 20));
+    ///
+    /// let mut x2 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// x2.shift_right_with(17, true);
+    ///
+    /// assert_eq!(x2.len(), 20);
+    /// assert_eq!(x2, Bits::slice(&[0xFE, 0xFF, 0xFF], 20));
+    /// ```
+    pub fn shift_right_with(&mut self, count: usize, bit: bool) {
+        self.shift_bytes_right_with(count, if bit { 0xFF } else { 0 })
     }
 
     /// Shifts out lower bits, shifting zeros into the upper bits.
@@ -2448,9 +2475,67 @@ impl Bits {
     pub fn shifted_right(&self, count: usize) -> Self {
         let mut clone = self.clone();
 
-        clone.shift_right(count);
+        clone.shift_bytes_right_with(count, 0);
 
         clone
+    }
+
+    /// Shifts out upper bits, shifting in zeros or ones on the lower end based on the lowest bit.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x1 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// x1.sticky_shift_left(17);
+    ///
+    /// assert_eq!(x1, Bits::slice(&[0x00, 0x00, 0x04], 20));
+    /// assert_eq!(x1.len(), 20);
+    ///
+    /// let mut x2 = Bits::from([0x09, 0x0B, 0x0C]);
+    ///
+    /// x2.sticky_shift_left(17);
+    ///
+    /// assert_eq!(x2, Bits::slice(&[0xFF, 0xFF, 0x03], 20));
+    /// assert_eq!(x2.len(), 20);
+    /// ```
+    pub fn sticky_shift_left(&mut self, count: usize) {
+        match self.size() {
+            0 => (),
+            _ => {
+                let bit = self.words[0] & 1;
+                self.shift_bytes_left_with(count, ((!bit as u16) + 1) as u8);
+            }
+        }
+    }
+
+    /// Shifts out lower bits, shifting zeros or ones into the upper bits based on the highest bit.
+    ///
+    /// # Examples
+    /// ```
+    /// # use bit_byte_bit::{Bits};
+    /// let mut x1 = Bits::slice(&[0x0A, 0x0B, 0x04], 20);
+    ///
+    /// x1.sticky_shift_right(17);
+    ///
+    /// assert_eq!(x1.len(), 20);
+    /// assert_eq!(x1, Bits::slice(&[0x02, 0x00, 0x00], 20));
+    ///
+    /// let mut x2 = Bits::from([0x0A, 0x0B, 0x0C]);
+    ///
+    /// x2.sticky_shift_right(17);
+    ///
+    /// assert_eq!(x2.len(), 20);
+    /// assert_eq!(x2, Bits::slice(&[0xFE, 0xFF, 0xFF], 20));
+    /// ```
+    pub fn sticky_shift_right(&mut self, count: usize) {
+        match self.size() {
+            0 => (),
+            n => {
+                let bit = (self.words[n - 1] >> (8 - self.padding - 1)) & 1;
+                self.shift_bytes_right_with(count, ((!bit as u16) + 1) as u8);
+            }
+        }
     }
 
     /// The number of bytes.
@@ -3129,6 +3214,80 @@ impl Bits {
             let overflow = self.nbits & 7;
             self.padding = (8 - overflow) & 7;
             self.mask = mask!(overflow);
+        }
+    }
+
+    fn shift_bytes_left_with(&mut self, count: usize, constant: u8) {
+        match (self.size(), count) {
+            (0, _) | (_, 0) => (),
+            (_, count) if count >= self.nbits => unsafe {
+                let pointer = self.words.as_ptr_mut();
+
+                for i in 0..self.size() { *pointer.add(i) = constant }
+            },
+            (n, count) => unsafe {
+                let pointer = self.words.as_ptr_mut();
+                let shift_overflow = count & 7;
+                let shift_bytes = count >> 3;
+
+                if shift_bytes > 0 {
+                    ptr::copy(pointer, pointer.add(shift_bytes), self.size() - shift_bytes);
+
+                    for i in 0..shift_bytes { *pointer.add(i) = constant; }
+
+                    *pointer.add(n - 1) &= self.mask;
+                }
+
+                if shift_overflow > 0 {
+                    let low = 8 - shift_overflow;
+
+
+                    for i in 1..n {
+                        *pointer.add(n - i) <<= shift_overflow;
+                        *pointer.add(n - i) |= *pointer.add(n - i - 1) >> low;
+                    }
+
+                    let low_mask = ((1 << shift_overflow) - 1) & constant;
+                    *pointer = (*pointer << shift_overflow) | low_mask;
+                }
+
+                *pointer.add(n - 1) &= self.mask;
+            }
+        }
+    }
+
+    fn shift_bytes_right_with(&mut self, count: usize, constant: u8) {
+        match (self.size(), count) {
+            (0, _) | (_, 0) => (),
+            (_, count) if count >= self.nbits => unsafe {
+                let pointer = self.words.as_ptr_mut();
+
+                for i in 0..self.size() { *pointer.add(i) = constant }
+            },
+            (n, count) => unsafe {
+                let upper_mask = ((constant as u16) << (8 - self.padding)) as u8;
+                let pointer = self.words.as_ptr_mut();
+                *pointer.add(n - 1) = (*pointer.add(n - 1) & self.mask) | upper_mask;
+                let byte_shift = count >> 3;
+
+                ptr::copy(pointer.add(byte_shift), pointer, self.size() - byte_shift);
+
+                for i in (self.size() - byte_shift)..self.size() {
+                    *pointer.add(i) = constant;
+                }
+
+                let overflow = count & 7;
+
+                if overflow > 0 {
+                    let mask = (1 << overflow) - 1;
+                    let low = 8 - overflow;
+                    let end = self.size() - byte_shift;
+                    self.words.shift_right(end, mask, low, overflow);
+
+                    let upper_mask = ((constant as u16) << low) as u8;
+                    *pointer.add(end - 1) |= upper_mask;
+                }
+            }
         }
     }
 
